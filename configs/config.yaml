@@ -1,0 +1,57 @@
+# Environment overrides are applied by internal/config after YAML parsing.
+# Keep credentials in the environment rather than interpolating them into YAML.
+app:
+  name: syranet-vpn
+  env: development
+  log_level: info
+  shutdown_timeout: 15s
+
+database:
+  host: localhost
+  port: 5432
+  name: vpn_service
+  user: vpn_admin
+  password: ""
+  ssl_mode: disable
+  max_open_conns: 10
+  min_open_conns: 2
+  max_conn_lifetime: 30m
+
+bots:
+  user_token: ""
+  admin_token: ""
+  admin_ids: []
+  polling_timeout: 30
+
+vpn:
+  ru_server_address: ""
+  nl_server_address: ""
+  nl_password: ""
+  hysteria_port: 443
+  socks_port: 8443
+  subscription_days: 30
+  hysteria_link_name: Syranet VPN
+  socks_link_name: Syranet VPN SOCKS
+  concurrent_connection_limit: 1
+  reminder_threshold: 72h
+
+  singbox:
+    config_path: /etc/sing-box/config.json
+    template_path: singbox_template.json
+    binary_path: /usr/bin/sing-box
+    config_dir: /etc/sing-box
+    use_systemd: true
+    service_name: sing-box
+    check_timeout: 10s
+
+  fallback:
+    hy2_password: ""
+    socks_username: ""
+    socks_password: ""
+
+monitoring:
+  enabled: true
+  clash_api_url: http://127.0.0.1:9090
+  poll_interval: 30s
+  disconnect_extra_sessions: false
+  admin_notification_enabled: true

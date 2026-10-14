@@ -1,0 +1,47 @@
+# Local credentials (keep the distributable example)
+.env
+.env.*
+!.env.example
+*.local
+/configs/*.local.*
+
+# Private keys, certificates, generated VPN configs and database backups
+*.key
+*.pem
+*.p12
+*.pfx
+/configs/config.json
+/configs/config.json.*
+/configs/singbox-check-*.json
+*.sql.gz
+*.dump
+*.backup
+*.backup.*
+/backups/
+/data/
+
+# Go build, test and profiling output
+/bin/
+/build/
+/dist/
+/vpn-service
+/vpn-service.exe
+*.test
+*.out
+*.prof
+/coverage/
+/coverage.txt
+
+# Local tools, editors and OS files
+/.agents/
+/.codex/
+/.aws/
+/.idea/
+/.vscode/
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

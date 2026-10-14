@@ -1,0 +1,60 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vpn-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:?Set DB_NAME in .env}
+      POSTGRES_USER: ${DB_USER:?Set DB_USER in .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:?Set DB_USER in .env} -d ${DB_NAME:?Set DB_NAME in .env}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  syranet-vpn:
+    build: .
+    container_name: syranet-vpn
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # The application always connects to the Compose database service.
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:?Set DB_NAME in .env}
+      DB_USER: ${DB_USER:?Set DB_USER in .env}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      USER_BOT_TOKEN: ${USER_BOT_TOKEN:?Set USER_BOT_TOKEN in .env}
+      ADMIN_BOT_TOKEN: ${ADMIN_BOT_TOKEN:?Set ADMIN_BOT_TOKEN in .env}
+      ADMIN_IDS: ${ADMIN_IDS:?Set ADMIN_IDS in .env}
+      RU_SERVER_ADDRESS: ${RU_SERVER_ADDRESS:?Set RU_SERVER_ADDRESS in .env}
+      NL_SERVER_ADDRESS: ${NL_SERVER_ADDRESS:?Set NL_SERVER_ADDRESS in .env}
+      NL_PASSWORD: ${NL_PASSWORD:?Set NL_PASSWORD in .env}
+      SINGBOX_TEMPLATE_PATH: ${SINGBOX_TEMPLATE_PATH:-/app/configs/singbox_template.json}
+      FALLBACK_HY2_PASSWORD: ${FALLBACK_HY2_PASSWORD:-}
+      FALLBACK_SOCKS_USERNAME: ${FALLBACK_SOCKS_USERNAME:-}
+      FALLBACK_SOCKS_PASSWORD: ${FALLBACK_SOCKS_PASSWORD:-}
+      CLASH_API_URL: ${CLASH_API_URL:-http://host.docker.internal:9090}
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - /etc/sing-box:/etc/sing-box:rw
+      - /usr/bin/sing-box:/usr/bin/sing-box:ro
+      - /run/systemd:/run/systemd:ro
+      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    command: ["/usr/local/bin/vpn-service", "-config", "/app/configs/config.yaml"]
+
+volumes:
+  postgres_data:

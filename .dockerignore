@@ -1,0 +1,13 @@
+# Only application sources and distributable config enter the build context.
+**
+!go.mod
+!go.sum
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+!configs/
+!configs/config.yaml
+!configs/singbox_template.json
+!migrations/
+!migrations/*.sql
