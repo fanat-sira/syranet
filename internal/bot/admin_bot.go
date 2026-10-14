@@ -12,9 +12,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
 
-	"vpn-service/internal/config"
-	"vpn-service/internal/database"
-	"vpn-service/internal/models"
+	"github.com/fanat-sira/syranet/internal/config"
+	"github.com/fanat-sira/syranet/internal/database"
+	"github.com/fanat-sira/syranet/internal/models"
 )
 
 const adminUsersPageSize = 10
@@ -30,11 +30,11 @@ type AdminBot struct {
 }
 
 func NewAdminBot(cfg config.Config, store *database.Store, accessSync AccessSyncFunc, logger *zap.Logger) (*AdminBot, error) {
-	api, err := tgbotapi.NewBotAPI(cfg.Bots.AdminToken)
+	api, err := newAPI(cfg.Bots.AdminToken)
 	if err != nil {
-		return nil, fmt.Errorf("create admin bot api: %w", err)
+		return nil, errors.New("admin bot initialization failed; check ADMIN_BOT_TOKEN and Telegram connectivity")
 	}
-	api.Debug = strings.EqualFold(cfg.App.Env, "development")
+	api.Debug = false
 
 	return &AdminBot{
 		api:        api,
@@ -64,12 +64,12 @@ func (b *AdminBot) Run(ctx context.Context) error {
 			if update.Message == nil || update.Message.From == nil {
 				continue
 			}
-			if !b.cfg.IsAdmin(update.Message.From.ID) {
+			if !authorized(b.cfg, update.Message) {
 				_ = b.sendText(update.Message.Chat.ID, "Доступ запрещён.")
 				continue
 			}
 			if err := b.handleMessage(ctx, update.Message); err != nil {
-				b.logger.Error("handle admin message", zap.Error(err), zap.Int64("chat_id", update.Message.Chat.ID))
+				b.logger.Error("handle admin message", zap.String("kind", "request failed"))
 				_ = b.sendText(update.Message.Chat.ID, "Не удалось выполнить команду.")
 			}
 		}
@@ -80,7 +80,7 @@ func (b *AdminBot) NotifyAdmins(ctx context.Context, text string) error {
 	var sendErr error
 	for _, adminID := range b.cfg.Bots.AdminIDs {
 		if err := b.sendText(adminID, text); err != nil {
-			b.logger.Warn("notify admin", zap.Int64("admin_id", adminID), zap.Error(err))
+			b.logger.Warn("notify admin", zap.Int64("admin_id", adminID), zap.String("kind", "operation failed"))
 			sendErr = err
 		}
 	}
@@ -88,11 +88,43 @@ func (b *AdminBot) NotifyAdmins(ctx context.Context, text string) error {
 }
 
 func (b *AdminBot) handleMessage(ctx context.Context, message *tgbotapi.Message) error {
+	if !authorized(b.cfg, message) {
+		return errors.New("unauthorized private admin request")
+	}
+	if len(message.Text) > 512 {
+		return b.sendText(message.Chat.ID, "Сообщение слишком длинное.")
+	}
+	ctx = database.WithRequest(ctx, fmt.Sprintf("%d:%d", message.Chat.ID, message.MessageID))
+
 	if !message.IsCommand() {
 		return b.sendText(message.Chat.ID, b.helpText())
 	}
 
 	switch message.Command() {
+	case "nodes":
+		return b.handleNodes(ctx, message)
+	case "search":
+		users, e := b.store.Search(ctx, strings.TrimSpace(message.CommandArguments()))
+		if e != nil {
+			return e
+		}
+		var lines []string
+		for _, u := range users {
+			lines = append(lines, formatUserInfo(&u))
+		}
+		if len(lines) == 0 {
+			lines = append(lines, "Не найдено.")
+		}
+		return b.sendText(message.Chat.ID, strings.Join(lines, "\n"))
+	case "revoke", "rotate":
+		id, e := parseSingleInt64Arg(message.CommandArguments())
+		if e != nil || id <= 0 {
+			return b.sendText(message.Chat.ID, "Использование: /"+message.Command()+" <user_id>")
+		}
+		if e = b.store.Action(ctx, message.From.ID, id, message.Command(), 0, ""); e != nil {
+			return b.sendText(message.Chat.ID, "Операция недоступна для текущего состояния пользователя.")
+		}
+		return b.sendSyncAwareReply(ctx, message.Chat.ID, "Состояние credentials изменено.")
 	case "pending":
 		return b.handlePending(ctx, message)
 	case "approve":
@@ -129,16 +161,7 @@ func (b *AdminBot) handlePending(ctx context.Context, message *tgbotapi.Message)
 
 	lines := []string{"Pending users:"}
 	for _, user := range users {
-		lines = append(lines, fmt.Sprintf(
-			"ID=%d | tg=%d | @%s | %s %s | referral=%s | use=%s",
-			user.ID,
-			user.TelegramID,
-			emptyFallback(user.TelegramUsername, "unknown"),
-			user.FirstName,
-			user.LastName,
-			user.ReferralSource,
-			user.IntendedUse,
-		))
+		lines = append(lines, fmt.Sprintf("User %d: /approve %d, /reject %d <reason>", user.ID, user.ID, user.ID))
 	}
 	return b.sendText(message.Chat.ID, strings.Join(lines, "\n"))
 }
@@ -158,7 +181,7 @@ func (b *AdminBot) handleApprove(ctx context.Context, message *tgbotapi.Message)
 		}
 		return err
 	}
-	return b.sendSyncAwareReply(ctx, message.Chat.ID, fmt.Sprintf("Пользователь %d одобрен на %d дней.", userID, b.cfg.VPN.SubscriptionDays))
+	return b.sendSyncAwareReply(ctx, message.Chat.ID, fmt.Sprintf("Одобрение пользователя %d сохранено; действующий срок не сбрасывается.", userID))
 }
 
 func (b *AdminBot) handleReject(ctx context.Context, message *tgbotapi.Message) error {
@@ -189,7 +212,7 @@ func (b *AdminBot) handleUsers(ctx context.Context, message *tgbotapi.Message) e
 		}
 	}
 	offset := (page - 1) * adminUsersPageSize
-	users, total, err := b.store.ListUsersByStatuses(ctx, []models.UserStatus{models.UserStatusActive, models.UserStatusApproved, models.UserStatusSuspended, models.UserStatusExpired}, adminUsersPageSize, offset)
+	users, total, err := b.store.ListUsersByStatuses(ctx, []models.UserStatus{models.UserStatusActive, models.UserStatusRevoked, models.UserStatusSuspended, models.UserStatusExpired, models.UserStatusPending, models.UserStatusRejected}, adminUsersPageSize, offset)
 	if err != nil {
 		return err
 	}
@@ -203,7 +226,7 @@ func (b *AdminBot) handleUsers(ctx context.Context, message *tgbotapi.Message) e
 		if user.ExpiresAt != nil {
 			expiresAt = user.ExpiresAt.Format("2006-01-02")
 		}
-		lines = append(lines, fmt.Sprintf("ID=%d | @%s | status=%s | expires=%s | conn=%d", user.ID, emptyFallback(user.TelegramUsername, "unknown"), user.Status, expiresAt, user.CurrentConnections))
+		lines = append(lines, fmt.Sprintf("ID=%d | @%s | status=%s | expires=%s", user.ID, emptyFallback(user.TelegramUsername, "unknown"), user.Status, expiresAt))
 	}
 	return b.sendText(message.Chat.ID, strings.Join(lines, "\n"))
 }
@@ -270,7 +293,7 @@ func (b *AdminBot) handleInfo(ctx context.Context, message *tgbotapi.Message) er
 		}
 		return err
 	}
-	return b.sendText(message.Chat.ID, formatUserInfo(user))
+	return b.sendText(message.Chat.ID, formatReviewInfo(user))
 }
 
 func (b *AdminBot) handleStats(ctx context.Context, message *tgbotapi.Message) error {
@@ -279,12 +302,12 @@ func (b *AdminBot) handleStats(ctx context.Context, message *tgbotapi.Message) e
 		return err
 	}
 	text := fmt.Sprintf(
-		"Stats:\nTotal: %d\nActive: %d\nPending: %d\nExpired: %d\nApproved: %d\nRejected: %d\nSuspended: %d",
+		"Stats:\nTotal: %d\nActive: %d\nPending: %d\nExpired: %d\nRevoked: %d\nRejected: %d\nSuspended: %d",
 		stats.Total,
 		stats.Active,
 		stats.Pending,
 		stats.Expired,
-		stats.Approved,
+		stats.Revoked,
 		stats.Rejected,
 		stats.Suspended,
 	)
@@ -293,11 +316,11 @@ func (b *AdminBot) handleStats(ctx context.Context, message *tgbotapi.Message) e
 
 func (b *AdminBot) sendSyncAwareReply(ctx context.Context, chatID int64, successText string) error {
 	if b.accessSync == nil {
-		return b.sendText(chatID, successText)
+		return b.sendText(chatID, successText+"\nСинхронизация недоступна.")
 	}
 	if err := b.accessSync(ctx); err != nil {
-		b.logger.Error("sync access after admin command", zap.Error(err))
-		return b.sendText(chatID, successText+"\nНо синхронизация sing-box не удалась: "+err.Error())
+		b.logger.Error("sync access after admin command", zap.String("kind", "operation failed"))
+		return b.sendText(chatID, successText+"\nИзменение сохранено, но ещё не применено на сервере. Будет повторная попытка; проверь /nodes.")
 	}
 	return b.sendText(chatID, successText+"\nКонфигурация sing-box синхронизирована.")
 }
@@ -312,7 +335,7 @@ func (b *AdminBot) helpText() string {
 	return strings.Join([]string{
 		"Admin commands:",
 		"/pending - список pending",
-		"/approve <user_id> - одобрить на 30 дней",
+		fmt.Sprintf("/approve <user_id> - одобрить на %d дней", b.cfg.VPN.SubscriptionDays),
 		"/reject <user_id> <reason> - отклонить",
 		"/users [page] - активные/архивные пользователи",
 		"/extend <user_id> <days> - продлить",
@@ -320,6 +343,10 @@ func (b *AdminBot) helpText() string {
 		"/activate <user_id> - активировать",
 		"/info <user_id> - детали",
 		"/stats - статистика",
+		"/search <id|telegram_id|@username>",
+		"/revoke <id> - отозвать доступ",
+		"/rotate <id> - заменить credentials",
+		"/nodes - применение конфигурации",
 	}, "\n")
 }
 
@@ -331,37 +358,42 @@ func parseSingleInt64Arg(raw string) (int64, error) {
 	return strconv.ParseInt(args[0], 10, 64)
 }
 
-func formatUserInfo(user *models.User) string {
-	expiresAt := "-"
-	if user.ExpiresAt != nil {
-		expiresAt = user.ExpiresAt.Format(time.RFC3339)
+func formatUserInfo(u *models.User) string {
+	expiry := "not assigned"
+	if u.ExpiresAt != nil {
+		expiry = u.ExpiresAt.UTC().Format(time.RFC3339)
 	}
-	approvedAt := "-"
-	if user.ApprovedAt != nil {
-		approvedAt = user.ApprovedAt.Format(time.RFC3339)
+	return fmt.Sprintf("User %d | @%s\nStatus: %s\nExpires: %s\nEntry: %s", u.ID, u.TelegramUsername, u.Status, expiry, u.NodeID)
+}
+func (b *AdminBot) handleNodes(ctx context.Context, m *tgbotapi.Message) error {
+	states, e := b.store.SyncStates(ctx)
+	if e != nil {
+		return e
 	}
-	lastSeen := "-"
-	if user.LastConnectedAt != nil {
-		lastSeen = user.LastConnectedAt.Format(time.RFC3339)
+	lines := []string{"Node sync status:"}
+	for _, s := range states {
+		last := "never"
+		if s.LastSuccess != nil {
+			last = s.LastSuccess.UTC().Format(time.RFC3339)
+		}
+		lines = append(lines, fmt.Sprintf("%s: healthy=%t desired=%s applied=%s last=%s %s", s.NodeID, s.Healthy, shortHash(s.DesiredHash), shortHash(s.AppliedHash), last, s.Error))
 	}
-	return fmt.Sprintf(
-		"User %d\nTelegram ID: %d\nUsername: @%s\nName: %s %s\nStatus: %s\nCreated: %s\nApproved: %s\nExpires: %s\nReferral: %s\nUse: %s\nAccepted terms: %t\nHY2 user: %s\nSOCKS user: %s\nLast IP: %s\nLast seen: %s\nCurrent connections: %d",
-		user.ID,
-		user.TelegramID,
-		emptyFallback(user.TelegramUsername, "unknown"),
-		user.FirstName,
-		user.LastName,
-		user.Status,
-		user.CreatedAt.Format(time.RFC3339),
-		approvedAt,
-		expiresAt,
-		user.ReferralSource,
-		user.IntendedUse,
-		user.AcceptedTerms,
-		user.HY2Username,
-		user.SocksUsername,
-		emptyFallback(user.LastConnectedIP, "-"),
-		lastSeen,
-		user.CurrentConnections,
-	)
+	return b.sendText(m.Chat.ID, strings.Join(lines, "\n"))
+}
+func shortHash(h string) string {
+	if len(h) > 12 {
+		return h[:12]
+	}
+	return h
+}
+
+func formatReviewInfo(u *models.User) string {
+	return formatUserInfo(u) + fmt.Sprintf("\nReferral: %s\nPurpose: %s\nAccepted terms: %t", bounded(u.ReferralSource), bounded(u.IntendedUse), u.AcceptedTerms)
+}
+func bounded(s string) string {
+	r := []rune(s)
+	if len(r) > 128 {
+		return string(r[:128]) + "…"
+	}
+	return s
 }

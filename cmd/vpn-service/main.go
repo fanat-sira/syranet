@@ -2,214 +2,235 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/fanat-sira/syranet/internal/bot"
+	"github.com/fanat-sira/syranet/internal/config"
+	"github.com/fanat-sira/syranet/internal/database"
+	"github.com/fanat-sira/syranet/internal/node"
+	"github.com/fanat-sira/syranet/internal/service"
+	"go.uber.org/zap"
+	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
-
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
-
-	"vpn-service/internal/bot"
-	"vpn-service/internal/config"
-	"vpn-service/internal/database"
-	"vpn-service/internal/service"
 )
 
 func main() {
-	configPath := flag.String("config", envOrDefault("CONFIG_PATH", "configs/config.yaml"), "path to config file")
-	flag.Parse()
-
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		panic(err)
+	if e := run(); e != nil {
+		fmt.Fprintln(os.Stderr, e)
+		os.Exit(1)
 	}
-
-	logger, err := newLogger(cfg.App.LogLevel, cfg.App.Env)
-	if err != nil {
-		panic(err)
+}
+func run() error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if len(os.Args) > 1 && os.Args[1] == "node" {
+		return runNode(ctx, os.Args[2:])
 	}
-	defer logger.Sync() //nolint:errcheck
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
-
-	store, err := database.New(ctx, cfg.Database, logger.Named("database"))
-	if err != nil {
-		logger.Fatal("connect database", zap.Error(err))
+	if len(os.Args) > 1 && os.Args[1] == "health" {
+		return health()
+	}
+	flags := flag.NewFlagSet("syranet", flag.ContinueOnError)
+	path := flags.String("config", env("CONFIG_PATH", "configs/config.yaml"), "platform YAML")
+	check := flags.Bool("check", false, "validate without connecting or changing state")
+	migrate := flags.Bool("migrate", false, "apply database migrations and exit")
+	if e := flags.Parse(os.Args[1:]); e != nil {
+		return e
+	}
+	if !*check && !*migrate {
+		initial, _ := json.Marshal(struct {
+			Ready bool      `json:"ready"`
+			Time  time.Time `json:"time"`
+		}{false, time.Now().UTC()})
+		if node.AtomicWrite("/state/health.json", initial) != nil {
+			return errors.New("management state directory is not writable")
+		}
+	}
+	cfg, e := config.Load(*path)
+	if e != nil {
+		return e
+	}
+	if *check {
+		return nil
+	}
+	logConfig := zap.NewProductionConfig()
+	if e = logConfig.Level.UnmarshalText([]byte(cfg.App.LogLevel)); e != nil {
+		return errors.New("invalid app.log_level")
+	}
+	logger, e := logConfig.Build()
+	if e != nil {
+		return errors.New("logger initialization failed")
+	}
+	defer logger.Sync()
+	store, e := database.New(ctx, cfg.Database, logger)
+	if e != nil {
+		return errors.New("database unavailable; check DB settings")
 	}
 	defer store.Close()
-
-	questionnaire := bot.NewQuestionnaireManager()
-	keygen := service.NewKeyGenerator(cfg.VPN.RUAddress, cfg.VPN.HysteriaPort, cfg.VPN.SocksPort, cfg.VPN.HysteriaLinkName)
-	configGenerator := service.NewConfigGenerator(cfg.VPN)
-	singboxManager := service.NewSingBoxManager(cfg.VPN.SingBox, configGenerator, logger.Named("singbox"))
-
-	syncAccess := func(syncCtx context.Context) error {
-		users, err := store.ListConfigUsers(syncCtx)
-		if err != nil {
-			return err
+	if e = store.Migrate(ctx); e != nil {
+		return e
+	}
+	if *migrate {
+		return nil
+	}
+	rec, e := service.NewReconciler(cfg, store)
+	if e != nil {
+		return e
+	}
+	admin, e := bot.NewAdminBot(*cfg, store, rec.Sync, logger)
+	if e != nil {
+		return e
+	}
+	user, e := bot.NewUserBot(*cfg, store, bot.NewQuestionnaireManager(), service.NewKeyGenerator(), admin, logger)
+	if e != nil {
+		return e
+	}
+	user.SetSync(rec.Sync)
+	errs := make(chan error, 2)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() { defer workers.Done(); errs <- admin.Run(ctx) }()
+	go func() { defer workers.Done(); errs <- user.Run(ctx) }()
+	defer func() {
+		cancel()
+		done := make(chan struct{})
+		go func() { workers.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(cfg.App.ShutdownTimeout):
 		}
-		return singboxManager.SyncUsers(syncCtx, users)
-	}
-
-	adminBot, err := bot.NewAdminBot(*cfg, store, syncAccess, logger)
-	if err != nil {
-		logger.Fatal("create admin bot", zap.Error(err))
-	}
-
-	userBot, err := bot.NewUserBot(*cfg, store, questionnaire, keygen, adminBot, logger)
-	if err != nil {
-		logger.Fatal("create user bot", zap.Error(err))
-	}
-
-	if err := syncAccess(ctx); err != nil {
-		logger.Warn("initial sing-box sync failed", zap.Error(err))
-	}
-
-	monitor := service.NewClashMonitor(store, cfg.Monitoring, cfg.VPN.ConcurrentConnectionLimit, adminBot, logger.Named("monitor"))
-
-	var wg sync.WaitGroup
-	errCh := make(chan error, 4)
-
-	run := func(name string, fn func(context.Context) error) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := fn(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				logger.Error("component stopped with error", zap.String("component", name), zap.Error(err))
-				select {
-				case errCh <- err:
-				default:
-				}
-				stop()
-			}
-		}()
-	}
-
-	run("user-bot", userBot.Run)
-	run("admin-bot", adminBot.Run)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		monitor.Run(ctx)
 	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		runHousekeeping(ctx, cfg, store, syncAccess, adminBot, logger.Named("housekeeping"))
-	}()
-
-	select {
-	case <-ctx.Done():
-	case err := <-errCh:
-		logger.Error("received component error", zap.Error(err))
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.App.ShutdownTimeout)
-	defer cancel()
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-shutdownCtx.Done():
-		logger.Warn("shutdown timeout exceeded")
-	}
-
-	logger.Info("syranet-vpn stopped")
-}
-
-func runHousekeeping(ctx context.Context, cfg *config.Config, store *database.Store, syncAccess func(context.Context) error, adminNotifier bot.AdminNotifier, logger *zap.Logger) {
-	ticker := time.NewTicker(30 * time.Minute)
+	ticker := time.NewTicker(cfg.App.ReconcileInterval)
 	defer ticker.Stop()
-
-	seenReminder := make(map[int64]time.Time)
-
-	check := func() {
-		expired, err := store.ExpireUsers(ctx)
-		if err != nil {
-			logger.Warn("expire users", zap.Error(err))
-		} else if expired > 0 {
-			logger.Info("expired users updated", zap.Int64("count", expired))
-			if err := syncAccess(ctx); err != nil {
-				logger.Warn("sync access after expiration", zap.Error(err))
-			}
+	lastAlert := time.Time{}
+	reminders := map[int64]time.Time{}
+	reconcile := func() {
+		_, expireErr := store.ExpireUsers(ctx)
+		syncErr := rec.Sync(ctx)
+		ready := expireErr == nil && syncErr == nil
+		state, _ := json.Marshal(struct {
+			Ready      bool      `json:"ready"`
+			Time       time.Time `json:"time"`
+			ValidUntil time.Time `json:"valid_until"`
+		}{ready, time.Now().UTC(), time.Now().UTC().Add(cfg.App.ReconcileInterval + 2*time.Minute)})
+		_ = node.AtomicWrite("/state/health.json", state)
+		if !ready && time.Since(lastAlert) > 15*time.Minute {
+			logger.Warn("infrastructure sync failed; desired access pending")
+			_ = admin.NotifyAdmins(ctx, "Infrastructure error: access changes pending. Check /nodes and node TLS/connectivity.")
+			lastAlert = time.Now()
 		}
-
-		users, err := store.ListUsersExpiringBefore(ctx, time.Now().Add(cfg.VPN.ReminderThreshold))
-		if err != nil {
-			logger.Warn("list expiring users", zap.Error(err))
-			return
-		}
-
-		for _, user := range users {
-			if user.ExpiresAt == nil || adminNotifier == nil {
-				continue
-			}
-			if last, ok := seenReminder[user.ID]; ok && time.Since(last) < 24*time.Hour {
-				continue
-			}
-			seenReminder[user.ID] = time.Now()
-
-			text := fmt.Sprintf(
-				"Subscription expiring soon\nUser ID: %d\nTelegram ID: %d\nUsername: @%s\nExpires at: %s",
-				user.ID,
-				user.TelegramID,
-				empty(user.TelegramUsername, "unknown"),
-				user.ExpiresAt.Format(time.RFC3339),
-			)
-			if err := adminNotifier.NotifyAdmins(ctx, text); err != nil {
-				logger.Warn("notify admins about expiring user", zap.Int64("user_id", user.ID), zap.Error(err))
+		expiring, e := store.ListUsersExpiringBefore(ctx, time.Now().Add(cfg.VPN.ReminderThreshold))
+		if e == nil {
+			for _, u := range expiring {
+				if time.Since(reminders[u.ID]) > 24*time.Hour {
+					if admin.NotifyAdmins(ctx, fmt.Sprintf("Subscription expiring: user %d. /info %d", u.ID, u.ID)) == nil {
+						reminders[u.ID] = time.Now()
+					}
+				}
 			}
 		}
 	}
-
-	check()
+	reconcile()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
+		case <-errs:
+			cancel()
+			return errors.New("Telegram component stopped")
 		case <-ticker.C:
-			check()
+			reconcile()
 		}
 	}
 }
-
-func newLogger(level, env string) (*zap.Logger, error) {
-	cfg := zap.NewProductionConfig()
-	if env == "development" {
-		cfg = zap.NewDevelopmentConfig()
-	}
-
-	parsedLevel := zapcore.InfoLevel
-	if err := parsedLevel.UnmarshalText([]byte(level)); err != nil {
-		return nil, err
-	}
-	cfg.Level = zap.NewAtomicLevelAt(parsedLevel)
-	return cfg.Build()
-}
-
-func envOrDefault(key, fallback string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
+func env(key, fallback string) string {
+	if s := os.Getenv(key); s != "" {
+		return s
 	}
 	return fallback
 }
-
-func empty(value, fallback string) string {
-	if value == "" {
-		return fallback
+func health() error {
+	if os.Getenv("SYRANET_ROLE") == "node" {
+		c, e := node.NewClient(env("NODE_HEALTH_URL", "http://127.0.0.1:8080"), os.Getenv("NODE_TOKEN"), os.Getenv("NODE_HEALTH_CA"))
+		if e != nil {
+			return e
+		}
+		s, e := c.Status(context.Background())
+		if e != nil || !s.Running || !s.TLSReady || s.Error != "" {
+			return errors.New("node not ready")
+		}
+		return nil
 	}
-	return value
+	b, e := os.ReadFile("/state/health.json")
+	if e != nil {
+		return errors.New("manager not ready")
+	}
+	var s struct {
+		Ready      bool
+		Time       time.Time
+		ValidUntil time.Time `json:"valid_until"`
+	}
+	if json.Unmarshal(b, &s) != nil || !s.Ready || !time.Now().Before(s.ValidUntil) {
+		return errors.New("manager reconciliation unhealthy")
+	}
+	return nil
+}
+func runNode(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("node", flag.ContinueOnError)
+	listen := flags.String("listen", env("NODE_LISTEN", ":8080"), "API listener")
+	dir := flags.String("state", env("NODE_STATE", "/state"), "private state directory")
+	binary := flags.String("binary", env("SINGBOX_BINARY", "/usr/local/bin/sing-box"), "pinned sing-box executable")
+	if e := flags.Parse(args); e != nil {
+		return e
+	}
+	token := os.Getenv("NODE_TOKEN")
+	if len(token) < 32 {
+		return errors.New("NODE_TOKEN must contain at least 32 characters")
+	}
+	version, e := exec.Command(*binary, "version").Output()
+	if e != nil || !strings.Contains(string(version), "sing-box version "+config.SingBoxVersion+"\n") {
+		return errors.New("node requires sing-box " + config.SingBoxVersion)
+	}
+	sup := node.New(*dir, &node.Process{Binary: *binary})
+	defer sup.Close()
+	if e = sup.Restore(ctx); e != nil {
+		fmt.Fprintln(os.Stderr, "persisted configuration could not start; awaiting reconciliation")
+	}
+	srv := &http.Server{Addr: *listen, Handler: node.Handler(sup, token), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 45 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16384}
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdown)
+	}()
+	cert, key := os.Getenv("NODE_API_TLS_CERT"), os.Getenv("NODE_API_TLS_KEY")
+	if cert != "" && key != "" {
+		if _, e = tls.LoadX509KeyPair(cert, key); e != nil {
+			return errors.New("node API TLS certificate/key cannot be loaded")
+		}
+		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			pair, e := tls.LoadX509KeyPair(cert, key)
+			return &pair, e
+		}}
+		e = srv.ListenAndServeTLS("", "")
+	} else if cert != "" || key != "" {
+		return errors.New("both NODE_API_TLS_CERT and NODE_API_TLS_KEY are required")
+	} else {
+		if os.Getenv("NODE_ALLOW_PLAINTEXT") != "true" {
+			return errors.New("node API requires TLS; NODE_ALLOW_PLAINTEXT only for an unpublished internal Compose network")
+		}
+		e = srv.ListenAndServe()
+	}
+	if errors.Is(e, http.ErrServerClosed) {
+		return nil
+	}
+	return errors.New("node API cannot listen; inspect ports and TLS files")
 }

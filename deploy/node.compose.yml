@@ -1,0 +1,34 @@
+# On every remote VPS: clone repo, prepare certs, create private .node.env.
+services:
+  node:
+    build:
+      context: ..
+      target: node
+    environment:
+      NODE_TOKEN: ${NODE_TOKEN:?Set private .node.env NODE_TOKEN}
+      NODE_LISTEN: ':8443'
+      NODE_API_TLS_CERT: /certs/fullchain.pem
+      NODE_API_TLS_KEY: /certs/privkey.pem
+      NODE_HEALTH_URL: https://${NODE_DOMAIN:?Set NODE_DOMAIN}:8443
+    extra_hosts:
+      - '${NODE_DOMAIN}:127.0.0.1'
+    ports:
+      - '${HYSTERIA_PORT:-443}:${HYSTERIA_PORT:-443}/udp'
+      - '${MANAGEMENT_BIND_IP:-127.0.0.1}:8443:8443/tcp'
+    volumes:
+      - state:/state
+      - ${CERTS_DIR:-../certs}:/certs:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:size=16m,mode=1777]
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+    healthcheck:
+      test: [CMD, /usr/local/bin/syranet, health]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+volumes:
+  state: {}

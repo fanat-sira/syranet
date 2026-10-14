@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    environment:
+      POSTGRES_DB: syranet_test
+      POSTGRES_USER: syranet_test
+      POSTGRES_PASSWORD: ${TEST_DB_PASSWORD:?Test runner generates this}
+    volumes: [database:/var/lib/postgresql/data]
+    networks: [test]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U syranet_test -d syranet_test']
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  node:
+    build: {context: ../.., target: node}
+    environment:
+      NODE_TOKEN: ${ENTRY_AGENT_TOKEN:?Test only}
+      NODE_ALLOW_PLAINTEXT: 'true'
+    volumes:
+      - entry_state:/state
+      - ${SYRANET_E2E_DIR}/certs:/certs:ro
+    networks: [test]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    sysctls: {net.ipv4.ip_unprivileged_port_start: 0}
+  upstream:
+    build: {context: ../.., target: node}
+    environment:
+      NODE_TOKEN: ${UPSTREAM_AGENT_TOKEN:?Test only}
+      NODE_LISTEN: ':8443'
+      NODE_API_TLS_CERT: /certs/fullchain.pem
+      NODE_API_TLS_KEY: /certs/privkey.pem
+    volumes:
+      - upstream_state:/state
+      - ${SYRANET_E2E_DIR}/certs:/certs:ro
+    networks: [test]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    sysctls: {net.ipv4.ip_unprivileged_port_start: 0}
+  tester:
+    build: {context: ../.., target: tests}
+    entrypoint: [go]
+    command: [test, ./tests/e2e, -run, TestAccessPipeline, -count=1, -v]
+    env_file: ['${SYRANET_E2E_DIR}/test.env']
+    environment:
+      SYRANET_E2E: disposable
+      SYRANET_TEST_DATABASE: disposable
+      SINGBOX_TEST_BINARY: /usr/local/bin/sing-box
+      TEST_DB_HOST: postgres
+    volumes:
+      - ${SYRANET_E2E_DIR}/config.yaml:/test/config.yaml:ro
+      - ${SYRANET_E2E_DIR}/certs:/certs:ro
+    networks: [test]
+    depends_on:
+      postgres: {condition: service_healthy}
+      node: {condition: service_started}
+      upstream: {condition: service_started}
+networks:
+  test: {}
+volumes:
+  database: {}
+  entry_state: {}
+  upstream_state: {}

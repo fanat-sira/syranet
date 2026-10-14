@@ -6,14 +6,15 @@ type UserStatus string
 
 const (
 	UserStatusPending   UserStatus = "pending"
-	UserStatusApproved  UserStatus = "approved"
 	UserStatusActive    UserStatus = "active"
 	UserStatusExpired   UserStatus = "expired"
 	UserStatusSuspended UserStatus = "suspended"
 	UserStatusRejected  UserStatus = "rejected"
+	UserStatusRevoked   UserStatus = "revoked"
 )
 
 type User struct {
+	NodeID             string     `db:"node_id"`
 	ID                 int64      `db:"id"`
 	TelegramID         int64      `db:"telegram_id"`
 	TelegramUsername   string     `db:"telegram_username"`
@@ -37,21 +38,12 @@ type User struct {
 	CurrentConnections int        `db:"current_connections"`
 }
 
-type AdminLog struct {
-	ID           int64     `db:"id"`
-	AdminID      int64     `db:"admin_id"`
-	TargetUserID *int64    `db:"target_user_id"`
-	Action       string    `db:"action"`
-	Reason       string    `db:"reason"`
-	CreatedAt    time.Time `db:"created_at"`
-}
-
 type UserStats struct {
 	Total     int `db:"total"`
 	Active    int `db:"active"`
 	Pending   int `db:"pending"`
 	Expired   int `db:"expired"`
-	Approved  int `db:"approved"`
+	Revoked   int `db:"revoked"`
 	Rejected  int `db:"rejected"`
 	Suspended int `db:"suspended"`
 }
@@ -61,7 +53,7 @@ func (u User) HasCompletedQuestionnaire() bool {
 }
 
 func (u User) IsSubscriptionActive(now time.Time) bool {
-	if u.Status != UserStatusApproved && u.Status != UserStatusActive {
+	if u.Status != UserStatusActive {
 		return false
 	}
 	if u.ExpiresAt == nil {
@@ -78,5 +70,9 @@ func (u User) DaysUntilExpiry(now time.Time) int {
 	if duration <= 0 {
 		return 0
 	}
-	return int(duration.Hours()/24) + 1
+	days := duration / (24 * time.Hour)
+	if duration%(24*time.Hour) != 0 {
+		days++
+	}
+	return int(days)
 }

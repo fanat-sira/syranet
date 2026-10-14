@@ -1,0 +1,47 @@
+app:
+  log_level: info
+  reconcile_interval: 15s
+  shutdown_timeout: 15s
+policy:
+  subscription_days: 30
+  reminder_threshold: 72h
+  default_node: entry
+nodes:
+  - id: entry
+    name: My server
+    enabled: true
+    entry: true
+    public_address: vpn.example.com
+    listen_address: '::'
+    port: 443
+    tls:
+      server_name: vpn.example.com
+      certificate_path: /certs/fullchain.pem
+      key_path: /certs/privkey.pem
+    agent:
+      url: http://node:8080
+      token_env: ENTRY_AGENT_TOKEN
+    outbound: upstream
+    socks:
+      enabled: false
+      listen_address: 127.0.0.1
+      port: 1080
+      allow_public: false
+  - id: upstream
+    name: Upstream
+    enabled: true
+    entry: false
+    public_address: upstream.example.net
+    listen_address: '::'
+    port: 443
+    tls:
+      server_name: upstream.example.net
+      certificate_path: /certs/fullchain.pem
+      key_path: /certs/privkey.pem
+    agent:
+      url: https://upstream.example.net:8443
+      token_env: UPSTREAM_AGENT_TOKEN
+    transit_password_env: UPSTREAM_TRANSIT_PASSWORD
+    outbound: direct
+    socks:
+      enabled: false

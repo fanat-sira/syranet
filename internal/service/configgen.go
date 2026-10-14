@@ -1,99 +1,55 @@
 package service
 
 import (
-	"bytes"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
-	"strconv"
-
-	"vpn-service/internal/config"
-	"vpn-service/internal/models"
+	"github.com/fanat-sira/syranet/internal/config"
+	"github.com/fanat-sira/syranet/internal/models"
+	"github.com/fanat-sira/syranet/internal/node"
+	"time"
 )
 
-type ConfigGenerator struct {
-	templatePath string
-	vpn          config.VPNConfig
-}
-
-type hysteriaUser struct {
-	Username string `json:"username,omitempty"`
-	Password string `json:"password"`
-}
-
-type socksUser struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-}
-
-func NewConfigGenerator(vpn config.VPNConfig) *ConfigGenerator {
-	return &ConfigGenerator{templatePath: vpn.SingBox.TemplatePath, vpn: vpn}
-}
-
-func (g *ConfigGenerator) Generate(users []models.User) ([]byte, error) {
-	tpl, err := os.ReadFile(g.templatePath)
-	if err != nil {
-		return nil, fmt.Errorf("read template: %w", err)
+func Generate(c *config.Config, n config.Node, users []models.User, now time.Time) (node.Spec, error) {
+	if !n.Enabled {
+		n.Entry = false
+		n.TransitPassword = ""
+		n.Socks.Enabled = false
+		n.Outbound = "direct"
 	}
-
-	hy2Users := make([]hysteriaUser, 0, len(users)+1)
-	socksUsers := make([]socksUser, 0, len(users)+1)
-
-	if g.vpn.Fallback.HY2Password != "" {
-		hy2Users = append(hy2Users, hysteriaUser{Password: g.vpn.Fallback.HY2Password})
+	var spec node.Spec
+	spec.Log.Level = "error"
+	hy := []node.User{}
+	socks := []node.SocksUser{}
+	if n.TransitPassword != "" {
+		hy = append(hy, node.User{Name: "transit", Password: n.TransitPassword})
 	}
-	if g.vpn.Fallback.SocksUsername != "" && g.vpn.Fallback.SocksPassword != "" {
-		socksUsers = append(socksUsers, socksUser{
-			Username: g.vpn.Fallback.SocksUsername,
-			Password: g.vpn.Fallback.SocksPassword,
-		})
+	for _, u := range users {
+		selected := u.NodeID
+		if selected == "" {
+			selected = c.VPN.DefaultNode
+		}
+		if !n.Entry || selected != n.ID || !u.IsSubscriptionActive(now) {
+			continue
+		}
+		if len(u.HY2Password) < 16 {
+			return spec, errors.New("invalid stored credential")
+		}
+		hy = append(hy, node.User{Name: fmt.Sprintf("user_%d", u.ID), Password: u.HY2Password})
+		socks = append(socks, node.SocksUser{Username: u.SocksUsername, Password: u.SocksPassword})
 	}
-
-	for _, user := range users {
-		hy2Users = append(hy2Users, hysteriaUser{Username: user.HY2Username, Password: user.HY2Password})
-		socksUsers = append(socksUsers, socksUser{Username: user.SocksUsername, Password: user.SocksPassword})
+	spec.Inbounds = []node.Inbound{{Type: "hysteria2", Tag: "hy2", Listen: n.ListenAddress, Port: n.Port, Users: hy, TLS: &node.TLS{Enabled: true, ServerName: n.TLS.ServerName, CertificatePath: n.TLS.CertificatePath, KeyPath: n.TLS.KeyPath}}}
+	if n.Socks.Enabled && len(socks) > 0 {
+		spec.Inbounds = append(spec.Inbounds, node.Inbound{Type: "socks", Tag: "socks", Listen: n.Socks.ListenAddress, Port: n.Socks.Port, Users: socks})
 	}
-
-	hy2JSON, err := json.Marshal(hy2Users)
-	if err != nil {
-		return nil, fmt.Errorf("marshal hysteria users: %w", err)
+	out := node.Outbound{Type: "direct", Tag: "egress"}
+	if n.Outbound != "direct" {
+		up, ok := c.Node(n.Outbound)
+		if !ok {
+			return spec, errors.New("upstream unavailable")
+		}
+		out = node.Outbound{Type: "hysteria2", Tag: "egress", Server: up.PublicAddress, Port: up.Port, Password: up.TransitPassword, TLS: &node.OutTLS{Enabled: true, ServerName: up.TLS.ServerName, CertificatePath: up.TLS.CAPath}}
 	}
-	socksJSON, err := json.Marshal(socksUsers)
-	if err != nil {
-		return nil, fmt.Errorf("marshal socks users: %w", err)
-	}
-
-	rendered := bytes.Clone(tpl)
-	rendered = bytes.ReplaceAll(rendered, []byte("\"__HY2_USERS__\""), hy2JSON)
-	rendered = bytes.ReplaceAll(rendered, []byte("\"__SOCKS_USERS__\""), socksJSON)
-	rendered = bytes.ReplaceAll(rendered, []byte("\"__HYSTERIA_PORT__\""), []byte(strconv.Itoa(g.vpn.HysteriaPort)))
-	rendered = bytes.ReplaceAll(rendered, []byte("\"__SOCKS_PORT__\""), []byte(strconv.Itoa(g.vpn.SocksPort)))
-
-	rendered, err = replaceQuotedPlaceholder(rendered, "__NL_SERVER_ADDRESS__", g.vpn.NLAddress)
-	if err != nil {
-		return nil, err
-	}
-	rendered, err = replaceQuotedPlaceholder(rendered, "__NL_PASSWORD__", g.vpn.NLPassword)
-	if err != nil {
-		return nil, err
-	}
-
-	var payload any
-	if err := json.Unmarshal(rendered, &payload); err != nil {
-		return nil, fmt.Errorf("validate generated json: %w", err)
-	}
-
-	pretty, err := json.MarshalIndent(payload, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("format generated config: %w", err)
-	}
-	return pretty, nil
-}
-
-func replaceQuotedPlaceholder(source []byte, placeholder, value string) ([]byte, error) {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return nil, fmt.Errorf("marshal placeholder %s: %w", placeholder, err)
-	}
-	return bytes.ReplaceAll(source, []byte(fmt.Sprintf("\"%s\"", placeholder)), encoded), nil
+	spec.Outbounds = []node.Outbound{out}
+	spec.Route.Final = "egress"
+	return spec, spec.Validate()
 }

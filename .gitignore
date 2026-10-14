@@ -45,3 +45,15 @@
 *~
 .DS_Store
 Thumbs.db
+# Per-deployment topology and TLS files
+/configs/local.yaml
+/certs/
+/secrets/
+/tests/e2e/generated/
+
+__pycache__/
+*.py[cod]
+.node.env
+/trust/
+*.env
+.envrc

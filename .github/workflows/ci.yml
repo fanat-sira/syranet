@@ -1,0 +1,52 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  go:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.1'
+          cache: true
+      - name: Formatting
+        run: test -z "$(gofmt -l cmd internal migrations tests)"
+      - name: Verify modules
+        run: go mod verify
+      - name: Vet
+        run: go vet ./...
+      - name: Download verified pinned sing-box
+        run: python3 scripts/fetch-singbox.py
+      - name: Unit, race, generated config and real localhost TCP/UDP tests
+        env:
+          SINGBOX_TEST_BINARY: /tmp/syranet-tools/sing-box
+        run: go test -race -count=1 ./...
+      - name: Build
+        run: go build -trimpath -o /tmp/syranet ./cmd/vpn-service
+      - name: Vulnerability check
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - name: Script syntax
+        run: |
+          python3 -m py_compile scripts/*.py
+          for file in scripts/*.sh deploy.sh; do sh -n "$file"; done
+  infrastructure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - name: Disposable PostgreSQL, node agents and Hysteria2 lifecycle
+        run: python3 scripts/e2e.py
+  secrets:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

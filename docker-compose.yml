@@ -1,60 +1,92 @@
 services:
   postgres:
-    image: postgres:16-alpine
-    container_name: vpn-postgres
+    image: postgres:16.15-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     environment:
-      POSTGRES_DB: ${DB_NAME:?Set DB_NAME in .env}
-      POSTGRES_USER: ${DB_USER:?Set DB_USER in .env}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      POSTGRES_DB: ${DB_NAME:-syranet}
+      POSTGRES_USER: ${DB_USER:-syranet}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Run scripts/setup.py}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d:ro
-    ports:
-      - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:?Set DB_USER in .env} -d ${DB_NAME:?Set DB_NAME in .env}"]
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 12
+    networks: [control]
     restart: unless-stopped
 
-  syranet-vpn:
-    build: .
-    container_name: syranet-vpn
-    depends_on:
-      postgres:
-        condition: service_healthy
-    env_file:
-      - .env
+  node:
+    build:
+      context: .
+      target: node
     environment:
-      # The application always connects to the Compose database service.
-      DB_HOST: postgres
-      DB_PORT: "5432"
-      DB_NAME: ${DB_NAME:?Set DB_NAME in .env}
-      DB_USER: ${DB_USER:?Set DB_USER in .env}
-      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
-      USER_BOT_TOKEN: ${USER_BOT_TOKEN:?Set USER_BOT_TOKEN in .env}
-      ADMIN_BOT_TOKEN: ${ADMIN_BOT_TOKEN:?Set ADMIN_BOT_TOKEN in .env}
-      ADMIN_IDS: ${ADMIN_IDS:?Set ADMIN_IDS in .env}
-      RU_SERVER_ADDRESS: ${RU_SERVER_ADDRESS:?Set RU_SERVER_ADDRESS in .env}
-      NL_SERVER_ADDRESS: ${NL_SERVER_ADDRESS:?Set NL_SERVER_ADDRESS in .env}
-      NL_PASSWORD: ${NL_PASSWORD:?Set NL_PASSWORD in .env}
-      SINGBOX_TEMPLATE_PATH: ${SINGBOX_TEMPLATE_PATH:-/app/configs/singbox_template.json}
-      FALLBACK_HY2_PASSWORD: ${FALLBACK_HY2_PASSWORD:-}
-      FALLBACK_SOCKS_USERNAME: ${FALLBACK_SOCKS_USERNAME:-}
-      FALLBACK_SOCKS_PASSWORD: ${FALLBACK_SOCKS_PASSWORD:-}
-      CLASH_API_URL: ${CLASH_API_URL:-http://host.docker.internal:9090}
-      APP_ENV: ${APP_ENV:-production}
-      LOG_LEVEL: ${LOG_LEVEL:-info}
+      NODE_TOKEN: ${ENTRY_AGENT_TOKEN:?Run scripts/setup.py}
+      NODE_ALLOW_PLAINTEXT: 'true'
+    ports:
+      - '${HYSTERIA_PORT:-443}:${HYSTERIA_PORT:-443}/udp'
     volumes:
-      - /etc/sing-box:/etc/sing-box:rw
-      - /usr/bin/sing-box:/usr/bin/sing-box:ro
-      - /run/systemd:/run/systemd:ro
-      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - node_state:/state
+      - ${CERTS_DIR:-./certs}:/certs:ro
+    networks: [control, node_egress]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:size=16m,mode=1777]
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+    healthcheck:
+      test: [CMD, /usr/local/bin/syranet, health]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
-    command: ["/usr/local/bin/vpn-service", "-config", "/app/configs/config.yaml"]
 
+  manager:
+    env_file: [.env]
+    build:
+      context: .
+      target: runtime
+    environment:
+      SYRANET_ROLE: manager
+      CONFIG_PATH: /app/config.yaml
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      DB_NAME: ${DB_NAME:-syranet}
+      DB_USER: ${DB_USER:-syranet}
+      DB_PASSWORD: ${DB_PASSWORD:?Run scripts/setup.py}
+      DB_SSLMODE: disable
+      USER_BOT_TOKEN: ${USER_BOT_TOKEN:?Run scripts/setup.py}
+      ADMIN_BOT_TOKEN: ${ADMIN_BOT_TOKEN:?Run scripts/setup.py}
+      ADMIN_IDS: ${ADMIN_IDS:?Run scripts/setup.py}
+      ENTRY_AGENT_TOKEN: ${ENTRY_AGENT_TOKEN:?Run scripts/setup.py}
+      UPSTREAM_AGENT_TOKEN: ${UPSTREAM_AGENT_TOKEN:-}
+      UPSTREAM_TRANSIT_PASSWORD: ${UPSTREAM_TRANSIT_PASSWORD:-}
+      BOT_POLLING_TIMEOUT: ${BOT_POLLING_TIMEOUT:-30}
+    volumes:
+      - ${PLATFORM_CONFIG:-./configs/local.yaml}:/app/config.yaml:ro
+      - manager_state:/state
+      - ${TRUST_DIR:-./trust}:/certs:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+      node: {condition: service_started}
+    networks: [control, manager_egress]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp:size=16m,mode=1777]
+    healthcheck:
+      test: [CMD, /usr/local/bin/syranet, health]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+networks:
+  control: {internal: true}
+  node_egress: {}
+  manager_egress: {}
 volumes:
-  postgres_data:
+  postgres_data: {}
+  node_state: {}
+  manager_state: {}

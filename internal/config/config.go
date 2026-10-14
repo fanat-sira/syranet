@@ -3,401 +3,304 @@ package config
 import (
 	"errors"
 	"fmt"
+	"go.yaml.in/yaml/v3"
+	"io"
 	"net"
 	"net/url"
 	"os"
-	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
+const SingBoxVersion = "1.14.3"
+
 type Config struct {
-	App        AppConfig        `yaml:"app"`
-	Database   DatabaseConfig   `yaml:"database"`
-	Bots       BotsConfig       `yaml:"bots"`
-	VPN        VPNConfig        `yaml:"vpn"`
-	Monitoring MonitoringConfig `yaml:"monitoring"`
+	App      AppConfig      `yaml:"app"`
+	Database DatabaseConfig `yaml:"-"`
+	Bots     BotsConfig     `yaml:"-"`
+	VPN      Policy         `yaml:"policy"`
+	Nodes    []Node         `yaml:"nodes"`
 }
-
 type AppConfig struct {
-	Name            string        `yaml:"name"`
-	Env             string        `yaml:"env"`
-	LogLevel        string        `yaml:"log_level"`
-	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
+	LogLevel          string        `yaml:"log_level"`
+	ReconcileInterval time.Duration `yaml:"reconcile_interval"`
+	ShutdownTimeout   time.Duration `yaml:"shutdown_timeout"`
 }
-
 type DatabaseConfig struct {
-	Host            string        `yaml:"host"`
-	Port            int           `yaml:"port"`
-	Name            string        `yaml:"name"`
-	User            string        `yaml:"user"`
-	Password        string        `yaml:"password"`
-	SSLMode         string        `yaml:"ssl_mode"`
-	MaxOpenConns    int32         `yaml:"max_open_conns"`
-	MinOpenConns    int32         `yaml:"min_open_conns"`
-	MaxConnLifetime time.Duration `yaml:"max_conn_lifetime"`
+	Host                          string
+	Port                          int
+	Name, User, Password, SSLMode string
+	MaxOpenConns, MinOpenConns    int32
+	MaxConnLifetime               time.Duration
 }
-
 type BotsConfig struct {
-	UserToken      string  `yaml:"user_token"`
-	AdminToken     string  `yaml:"admin_token"`
-	AdminIDs       []int64 `yaml:"admin_ids"`
-	PollingTimeout int     `yaml:"polling_timeout"`
+	UserToken, AdminToken string
+	AdminIDs              []int64
+	PollingTimeout        int
+}
+type Policy struct {
+	SubscriptionDays  int           `yaml:"subscription_days"`
+	ReminderThreshold time.Duration `yaml:"reminder_threshold"`
+	DefaultNode       string        `yaml:"default_node"`
+}
+type TLS struct {
+	ServerName      string `yaml:"server_name"`
+	CertificatePath string `yaml:"certificate_path"`
+	KeyPath         string `yaml:"key_path"`
+	CAPath          string `yaml:"ca_path,omitempty"`
+}
+type Node struct {
+	ID                 string `yaml:"id"`
+	Name               string `yaml:"name"`
+	Enabled            bool   `yaml:"enabled"`
+	Entry              bool   `yaml:"entry"`
+	PublicAddress      string `yaml:"public_address"`
+	ListenAddress      string `yaml:"listen_address"`
+	Port               int    `yaml:"port"`
+	TLS                TLS    `yaml:"tls"`
+	Agent              Agent  `yaml:"agent"`
+	Outbound           string `yaml:"outbound"`
+	TransitPasswordEnv string `yaml:"transit_password_env,omitempty"`
+	TransitPassword    string `yaml:"-"`
+	Socks              Socks  `yaml:"socks"`
+}
+type Agent struct {
+	URL      string `yaml:"url"`
+	TokenEnv string `yaml:"token_env"`
+	CAPath   string `yaml:"ca_path,omitempty"`
+	Token    string `yaml:"-"`
+}
+type Socks struct {
+	Enabled       bool   `yaml:"enabled"`
+	ListenAddress string `yaml:"listen_address"`
+	Port          int    `yaml:"port"`
+	AllowPublic   bool   `yaml:"allow_public"`
 }
 
-type VPNConfig struct {
-	RUAddress                 string         `yaml:"ru_server_address"`
-	NLAddress                 string         `yaml:"nl_server_address"`
-	NLPassword                string         `yaml:"nl_password"`
-	HysteriaPort              int            `yaml:"hysteria_port"`
-	SocksPort                 int            `yaml:"socks_port"`
-	SubscriptionDays          int            `yaml:"subscription_days"`
-	HysteriaLinkName          string         `yaml:"hysteria_link_name"`
-	SocksLinkName             string         `yaml:"socks_link_name"`
-	ConcurrentConnectionLimit int            `yaml:"concurrent_connection_limit"`
-	ReminderThreshold         time.Duration  `yaml:"reminder_threshold"`
-	SingBox                   SingBoxConfig  `yaml:"singbox"`
-	Fallback                  FallbackConfig `yaml:"fallback"`
-}
-
-type SingBoxConfig struct {
-	TemplatePath string        `yaml:"template_path"`
-	ConfigPath   string        `yaml:"config_path"`
-	BinaryPath   string        `yaml:"binary_path"`
-	ConfigDir    string        `yaml:"config_dir"`
-	UseSystemd   bool          `yaml:"use_systemd"`
-	ServiceName  string        `yaml:"service_name"`
-	PIDFilePath  string        `yaml:"pid_file_path"`
-	ReloadSignal string        `yaml:"reload_signal"`
-	CheckTimeout time.Duration `yaml:"check_timeout"`
-}
-
-type FallbackConfig struct {
-	HY2Password   string `yaml:"hy2_password"`
-	SocksUsername string `yaml:"socks_username"`
-	SocksPassword string `yaml:"socks_password"`
-}
-
-type MonitoringConfig struct {
-	Enabled                  bool          `yaml:"enabled"`
-	ClashAPIURL              string        `yaml:"clash_api_url"`
-	PollInterval             time.Duration `yaml:"poll_interval"`
-	DisconnectExtraSessions  bool          `yaml:"disconnect_extra_sessions"`
-	AdminNotificationEnabled bool          `yaml:"admin_notification_enabled"`
-}
+var identifier = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
+var secretEnv = regexp.MustCompile(`^[A-Z][A-Z0-9_]{1,63}$`)
+var botToken = regexp.MustCompile(`^[0-9]+:[A-Za-z0-9_-]+$`)
+var hostname = regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$`)
 
 func Load(path string) (*Config, error) {
-	cfg := defaultConfig()
-
-	if path != "" {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read config file: %w", err)
-		}
-		if err := yaml.Unmarshal([]byte(os.ExpandEnv(string(data))), cfg); err != nil {
-			return nil, fmt.Errorf("unmarshal config: %w", err)
+	c := &Config{App: AppConfig{LogLevel: "info", ReconcileInterval: 15 * time.Second, ShutdownTimeout: 15 * time.Second}, VPN: Policy{SubscriptionDays: 30, ReminderThreshold: 72 * time.Hour}, Database: DatabaseConfig{Host: "postgres", Port: 5432, Name: "syranet", User: "syranet", SSLMode: "disable", MaxOpenConns: 10, MinOpenConns: 1, MaxConnLifetime: 30 * time.Minute}, Bots: BotsConfig{PollingTimeout: 30}}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, errors.New("cannot read CONFIG_PATH")
+	}
+	defer f.Close()
+	dec := yaml.NewDecoder(f)
+	dec.KnownFields(true)
+	if err = dec.Decode(c); err != nil {
+		return nil, errors.New("invalid configuration YAML or unknown setting")
+	}
+	var extra any
+	if err = dec.Decode(&extra); err != io.EOF {
+		return nil, errors.New("configuration must contain one YAML document")
+	}
+	for key, target := range map[string]*string{"DB_HOST": &c.Database.Host, "DB_NAME": &c.Database.Name, "DB_USER": &c.Database.User, "DB_PASSWORD": &c.Database.Password, "DB_SSLMODE": &c.Database.SSLMode, "USER_BOT_TOKEN": &c.Bots.UserToken, "ADMIN_BOT_TOKEN": &c.Bots.AdminToken} {
+		if v, ok := os.LookupEnv(key); ok {
+			*target = v
 		}
 	}
-
-	applyEnv(cfg)
-	cfg.normalize(path)
-
-	if err := cfg.Validate(); err != nil {
+	if v, ok := os.LookupEnv("DB_PORT"); ok {
+		c.Database.Port, err = strconv.Atoi(v)
+		if err != nil {
+			return nil, errors.New("invalid DB_PORT")
+		}
+	}
+	for key, target := range map[string]*int{"BOT_POLLING_TIMEOUT": &c.Bots.PollingTimeout} {
+		if v, ok := os.LookupEnv(key); ok {
+			*target, err = strconv.Atoi(v)
+			if err != nil {
+				return nil, fmt.Errorf("invalid %s", key)
+			}
+		}
+	}
+	for _, v := range strings.Split(os.Getenv("ADMIN_IDS"), ",") {
+		id, e := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if e != nil || id <= 0 {
+			return nil, errors.New("invalid ADMIN_IDS")
+		}
+		c.Bots.AdminIDs = append(c.Bots.AdminIDs, id)
+	}
+	for i := range c.Nodes {
+		n := &c.Nodes[i]
+		n.Agent.Token = os.Getenv(n.Agent.TokenEnv)
+		n.TransitPassword = os.Getenv(n.TransitPasswordEnv)
+	}
+	if value, ok := os.LookupEnv("HYSTERIA_PORT"); ok {
+		published, parseErr := strconv.Atoi(value)
+		if parseErr != nil || !port(published) {
+			return nil, errors.New("invalid HYSTERIA_PORT")
+		}
+		for _, n := range c.Nodes {
+			if strings.HasPrefix(n.Agent.URL, "http://node:") && n.Port != published {
+				return nil, errors.New("HYSTERIA_PORT must match the local node.port")
+			}
+		}
+	}
+	if err = c.Validate(); err != nil {
 		return nil, err
 	}
-
-	return cfg, nil
+	return c, nil
 }
-
+func validAddress(s string) bool {
+	if ip := net.ParseIP(s); ip != nil {
+		return !ip.IsUnspecified() && !ip.IsMulticast()
+	}
+	if len(s) == 0 || len(s) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if len(label) > 63 || !hostname.MatchString(label) || strings.Contains(label, ".") {
+			return false
+		}
+	}
+	return true
+}
+func port(p int) bool { return p > 0 && p <= 65535 }
 func (c *Config) Validate() error {
-	var problems []string
-
-	if c.Database.Host == "" {
-		problems = append(problems, "database.host is required")
+	var p []string
+	if !validAddress(c.Database.Host) || !port(c.Database.Port) || c.Database.Name == "" || c.Database.User == "" || c.Database.Password == "" {
+		p = append(p, "invalid DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD")
 	}
-	if c.Database.Port == 0 {
-		problems = append(problems, "database.port is required")
+	if c.Database.SSLMode != "disable" && c.Database.SSLMode != "verify-full" {
+		p = append(p, "DB_SSLMODE must be disable (internal network) or verify-full")
 	}
-	if c.Database.Name == "" {
-		problems = append(problems, "database.name is required")
+	if !botToken.MatchString(c.Bots.UserToken) || !botToken.MatchString(c.Bots.AdminToken) || c.Bots.UserToken == c.Bots.AdminToken || len(c.Bots.AdminIDs) == 0 || c.Bots.PollingTimeout < 1 || c.Bots.PollingTimeout > 60 {
+		p = append(p, "invalid USER_BOT_TOKEN/ADMIN_BOT_TOKEN/ADMIN_IDS/BOT_POLLING_TIMEOUT")
 	}
-	if c.Database.User == "" {
-		problems = append(problems, "database.user is required")
+	for _, id := range c.Bots.AdminIDs {
+		if id <= 0 {
+			p = append(p, "invalid ADMIN_IDS")
+		}
 	}
-	if c.Database.Password == "" {
-		problems = append(problems, "database.password is required")
+	if c.App.ReconcileInterval < time.Second || c.App.ShutdownTimeout < time.Second || c.VPN.SubscriptionDays < 1 || c.VPN.SubscriptionDays > 3650 || c.VPN.ReminderThreshold <= 0 {
+		p = append(p, "invalid policy or app intervals")
 	}
-	if c.Bots.UserToken == "" {
-		problems = append(problems, "bots.user_token is required")
+	if c.App.LogLevel != "info" && c.App.LogLevel != "warn" && c.App.LogLevel != "error" {
+		p = append(p, "app.log_level must be info, warn or error")
 	}
-	if c.Bots.AdminToken == "" {
-		problems = append(problems, "bots.admin_token is required")
+	nodes := map[string]Node{}
+	agents := map[string]bool{}
+	for _, n := range c.Nodes {
+		prefix := "node: "
+		if identifier.MatchString(n.ID) {
+			prefix = "node " + n.ID + ": "
+		}
+		if len(n.Name) < 1 || len(n.Name) > 64 || strings.ContainsAny(n.Name, "\n\r\t") {
+			p = append(p, prefix+"invalid name")
+		}
+		if !secretEnv.MatchString(n.Agent.TokenEnv) || (n.TransitPasswordEnv != "" && !secretEnv.MatchString(n.TransitPasswordEnv)) {
+			p = append(p, prefix+"invalid secret environment key")
+		}
+		if agents[strings.TrimRight(n.Agent.URL, "/")] {
+			p = append(p, prefix+"agent.url must be unique per node")
+		}
+		agents[strings.TrimRight(n.Agent.URL, "/")] = true
+		if n.TLS.CAPath != "" && n.TLS.CAPath != "/certs/ca.pem" {
+			p = append(p, prefix+"tls.ca_path must be /certs/ca.pem")
+		}
+		if !identifier.MatchString(n.ID) || nodes[n.ID].ID != "" {
+			p = append(p, "invalid or duplicate node.id")
+		}
+		nodes[n.ID] = n
+		if !validAddress(n.PublicAddress) || net.ParseIP(n.ListenAddress) == nil || !port(n.Port) {
+			p = append(p, prefix+"invalid address or port")
+		}
+		if !validAddress(n.TLS.ServerName) || n.TLS.CertificatePath != "/certs/fullchain.pem" || n.TLS.KeyPath != "/certs/privkey.pem" {
+			p = append(p, prefix+"tls requires server_name and /certs/fullchain.pem, /certs/privkey.pem")
+		}
+		u, e := url.Parse(n.Agent.URL)
+		if e == nil && u.Port() != "" {
+			pnum, err := strconv.Atoi(u.Port())
+			if err != nil || !port(pnum) {
+				p = append(p, prefix+"invalid agent.url port")
+			}
+		}
+		if e != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+			p = append(p, prefix+"invalid agent.url")
+		} else if u.Scheme != "https" && (u.Scheme != "http" || u.Hostname() != "node") {
+			p = append(p, prefix+"remote agent.url requires HTTPS; HTTP only allowed for the private Compose service node")
+		}
+		if len(n.Agent.Token) < 32 {
+			p = append(p, prefix+"agent token missing or too short; check agent.token_env")
+		}
+		if n.TransitPasswordEnv != "" && len(n.TransitPassword) < 32 {
+			p = append(p, prefix+"transit password missing or too short")
+		}
+		if n.Outbound == "" {
+			p = append(p, prefix+"outbound must be direct or a node ID")
+		}
+		if n.Socks.Enabled {
+			ip := net.ParseIP(n.Socks.ListenAddress)
+			if ip == nil || !port(n.Socks.Port) || (!ip.IsLoopback() && !ip.IsPrivate() && !n.Socks.AllowPublic) {
+				p = append(p, prefix+"SOCKS requires a private listener or explicit allow_public")
+			}
+		}
 	}
-	if len(c.Bots.AdminIDs) == 0 {
-		problems = append(problems, "bots.admin_ids is required")
+	def := nodes[c.VPN.DefaultNode]
+	if !def.Enabled || !def.Entry {
+		p = append(p, "policy.default_node must be an enabled entry node")
 	}
-	if c.VPN.RUAddress == "" {
-		problems = append(problems, "vpn.ru_server_address is required")
+	for _, n := range c.Nodes {
+		if !n.Enabled {
+			continue
+		}
+		seen := map[string]bool{}
+		cur := n
+		for cur.Outbound != "direct" {
+			if seen[cur.ID] {
+				p = append(p, "topology contains a cycle")
+				break
+			}
+			seen[cur.ID] = true
+			next, ok := nodes[cur.Outbound]
+			if !ok || !next.Enabled || next.TransitPasswordEnv == "" {
+				p = append(p, "outbound requires an enabled node with transit_password_env")
+				break
+			}
+			cur = next
+		}
 	}
-	if c.VPN.NLAddress == "" {
-		problems = append(problems, "vpn.nl_server_address is required")
-	}
-	if c.VPN.NLPassword == "" {
-		problems = append(problems, "vpn.nl_password is required")
-	}
-	if c.VPN.SingBox.TemplatePath == "" {
-		problems = append(problems, "singbox.template_path is required")
-	}
-	if c.VPN.SingBox.ConfigPath == "" {
-		problems = append(problems, "singbox.config_path is required")
-	}
-	if c.VPN.SubscriptionDays <= 0 {
-		problems = append(problems, "vpn.subscription_days must be greater than zero")
-	}
-	if c.VPN.ConcurrentConnectionLimit <= 0 {
-		problems = append(problems, "vpn.concurrent_connection_limit must be greater than zero")
-	}
-	if c.Monitoring.Enabled && c.Monitoring.ClashAPIURL == "" {
-		problems = append(problems, "monitoring.clash_api_url is required when monitoring is enabled")
-	}
-	if c.VPN.SingBox.UseSystemd && c.VPN.SingBox.ServiceName == "" {
-		problems = append(problems, "vpn.singbox.service_name is required when use_systemd is enabled")
-	}
-	if (c.VPN.Fallback.SocksUsername == "") != (c.VPN.Fallback.SocksPassword == "") {
-		problems = append(problems, "vpn.fallback.socks_username and vpn.fallback.socks_password must be set together")
-	}
-
-	if len(problems) > 0 {
-		return errors.New(strings.Join(problems, "; "))
+	if len(p) > 0 {
+		return errors.New(strings.Join(p, "; "))
 	}
 	return nil
 }
-
 func (c *Config) DSN() string {
-	params := url.Values{}
-	params.Set("dbname", c.Database.Name)
-	params.Set("sslmode", c.Database.SSLMode)
-	params.Set("pool_max_conns", strconv.Itoa(int(c.Database.MaxOpenConns)))
-	params.Set("pool_min_conns", strconv.Itoa(int(c.Database.MinOpenConns)))
-	dsn := url.URL{
-		Scheme:   "postgresql",
-		User:     url.UserPassword(c.Database.User, c.Database.Password),
-		Host:     net.JoinHostPort(c.Database.Host, strconv.Itoa(c.Database.Port)),
-		RawQuery: params.Encode(),
-	}
-	return dsn.String()
+	q := url.Values{"sslmode": {c.Database.SSLMode}}
+	u := url.URL{Scheme: "postgresql", User: url.UserPassword(c.Database.User, c.Database.Password), Host: net.JoinHostPort(c.Database.Host, strconv.Itoa(c.Database.Port)), Path: "/" + c.Database.Name, RawQuery: q.Encode()}
+	return u.String()
 }
-
-func (c *Config) IsAdmin(telegramID int64) bool {
-	for _, id := range c.Bots.AdminIDs {
-		if id == telegramID {
+func (c *Config) IsAdmin(id int64) bool {
+	for _, a := range c.Bots.AdminIDs {
+		if a == id {
 			return true
 		}
 	}
 	return false
 }
-
-func (c *Config) normalize(configPath string) {
-	baseDir := "."
-	if configPath != "" {
-		baseDir = filepath.Dir(configPath)
+func (c *Config) Node(id string) (Node, bool) {
+	if id == "" {
+		id = c.VPN.DefaultNode
 	}
-
-	if !filepath.IsAbs(c.VPN.SingBox.TemplatePath) {
-		c.VPN.SingBox.TemplatePath = filepath.Clean(filepath.Join(baseDir, c.VPN.SingBox.TemplatePath))
-	}
-	if c.App.Name == "" {
-		c.App.Name = "syranet-vpn"
-	}
-	if c.App.Env == "" {
-		c.App.Env = "development"
-	}
-	if c.App.LogLevel == "" {
-		c.App.LogLevel = "info"
-	}
-	if c.Database.SSLMode == "" {
-		c.Database.SSLMode = "disable"
-	}
-	if c.VPN.SingBox.BinaryPath == "" {
-		c.VPN.SingBox.BinaryPath = "/usr/bin/sing-box"
-	}
-	if c.VPN.SingBox.ConfigDir == "" && c.VPN.SingBox.ConfigPath != "" {
-		c.VPN.SingBox.ConfigDir = filepath.Dir(c.VPN.SingBox.ConfigPath)
-	}
-	if c.VPN.SingBox.ServiceName == "" {
-		c.VPN.SingBox.ServiceName = "sing-box"
-	}
-	if c.VPN.SingBox.ReloadSignal == "" {
-		c.VPN.SingBox.ReloadSignal = "HUP"
-	}
-	if c.Monitoring.ClashAPIURL == "" {
-		c.Monitoring.ClashAPIURL = "http://127.0.0.1:9090"
-	}
-}
-
-func defaultConfig() *Config {
-	return &Config{
-		App: AppConfig{
-			Name:            "syranet-vpn",
-			Env:             "development",
-			LogLevel:        "info",
-			ShutdownTimeout: 15 * time.Second,
-		},
-		Database: DatabaseConfig{
-			Host:            "localhost",
-			Port:            5432,
-			Name:            "vpn_service",
-			User:            "vpn_admin",
-			Password:        "secure_password",
-			SSLMode:         "disable",
-			MaxOpenConns:    10,
-			MinOpenConns:    2,
-			MaxConnLifetime: 30 * time.Minute,
-		},
-		Bots: BotsConfig{
-			PollingTimeout: 30,
-		},
-		VPN: VPNConfig{
-			HysteriaPort:              443,
-			SocksPort:                 8443,
-			SubscriptionDays:          30,
-			HysteriaLinkName:          "Syranet VPN",
-			SocksLinkName:             "Syranet VPN SOCKS",
-			ConcurrentConnectionLimit: 1,
-			ReminderThreshold:         72 * time.Hour,
-			SingBox: SingBoxConfig{
-				TemplatePath: "configs/singbox_template.json",
-				ConfigPath:   "/etc/sing-box/config.json",
-				BinaryPath:   "/usr/bin/sing-box",
-				ConfigDir:    "/etc/sing-box",
-				UseSystemd:   true,
-				ServiceName:  "sing-box",
-				ReloadSignal: "HUP",
-				CheckTimeout: 10 * time.Second,
-			},
-		},
-		Monitoring: MonitoringConfig{
-			Enabled:                  true,
-			ClashAPIURL:              "http://127.0.0.1:9090",
-			PollInterval:             30 * time.Second,
-			DisconnectExtraSessions:  false,
-			AdminNotificationEnabled: true,
-		},
-	}
-}
-
-func applyEnv(cfg *Config) {
-	setString(&cfg.App.Env, "APP_ENV")
-	setString(&cfg.App.LogLevel, "LOG_LEVEL")
-	setDuration(&cfg.App.ShutdownTimeout, "APP_SHUTDOWN_TIMEOUT")
-
-	setString(&cfg.Database.Host, "DB_HOST")
-	setInt(&cfg.Database.Port, "DB_PORT")
-	setString(&cfg.Database.Name, "DB_NAME")
-	setString(&cfg.Database.User, "DB_USER")
-	setString(&cfg.Database.Password, "DB_PASSWORD")
-	setString(&cfg.Database.SSLMode, "DB_SSLMODE")
-	setInt32(&cfg.Database.MaxOpenConns, "DB_MAX_OPEN_CONNS")
-	setInt32(&cfg.Database.MinOpenConns, "DB_MIN_OPEN_CONNS")
-	setDuration(&cfg.Database.MaxConnLifetime, "DB_MAX_CONN_LIFETIME")
-
-	setString(&cfg.Bots.UserToken, "USER_BOT_TOKEN")
-	setString(&cfg.Bots.AdminToken, "ADMIN_BOT_TOKEN")
-	setIntSlice(&cfg.Bots.AdminIDs, "ADMIN_IDS")
-	setInt(&cfg.Bots.PollingTimeout, "BOT_POLLING_TIMEOUT")
-
-	setString(&cfg.VPN.RUAddress, "RU_SERVER_ADDRESS")
-	setString(&cfg.VPN.NLAddress, "NL_SERVER_ADDRESS")
-	setString(&cfg.VPN.NLPassword, "NL_PASSWORD")
-	setInt(&cfg.VPN.HysteriaPort, "HYSTERIA_PORT")
-	setInt(&cfg.VPN.SocksPort, "SOCKS_PORT")
-	setInt(&cfg.VPN.SubscriptionDays, "SUBSCRIPTION_DAYS")
-	setString(&cfg.VPN.HysteriaLinkName, "HYSTERIA_LINK_NAME")
-	setString(&cfg.VPN.SocksLinkName, "SOCKS_LINK_NAME")
-	setInt(&cfg.VPN.ConcurrentConnectionLimit, "CONCURRENT_CONNECTION_LIMIT")
-	setDuration(&cfg.VPN.ReminderThreshold, "REMINDER_THRESHOLD")
-
-	setString(&cfg.VPN.SingBox.TemplatePath, "SINGBOX_TEMPLATE_PATH")
-	setString(&cfg.VPN.SingBox.ConfigPath, "SINGBOX_CONFIG_PATH")
-	setString(&cfg.VPN.SingBox.BinaryPath, "SINGBOX_BINARY_PATH")
-	setString(&cfg.VPN.SingBox.ConfigDir, "SINGBOX_CONFIG_DIR")
-	setBool(&cfg.VPN.SingBox.UseSystemd, "SINGBOX_USE_SYSTEMD")
-	setString(&cfg.VPN.SingBox.ServiceName, "SINGBOX_SERVICE_NAME")
-	setString(&cfg.VPN.SingBox.PIDFilePath, "SINGBOX_PID_FILE")
-	setString(&cfg.VPN.SingBox.ReloadSignal, "SINGBOX_RELOAD_SIGNAL")
-	setDuration(&cfg.VPN.SingBox.CheckTimeout, "SINGBOX_CHECK_TIMEOUT")
-
-	setString(&cfg.VPN.Fallback.HY2Password, "FALLBACK_HY2_PASSWORD")
-	setString(&cfg.VPN.Fallback.SocksUsername, "FALLBACK_SOCKS_USERNAME")
-	setString(&cfg.VPN.Fallback.SocksPassword, "FALLBACK_SOCKS_PASSWORD")
-
-	setBool(&cfg.Monitoring.Enabled, "MONITORING_ENABLED")
-	setString(&cfg.Monitoring.ClashAPIURL, "CLASH_API_URL")
-	setDuration(&cfg.Monitoring.PollInterval, "CLASH_API_POLL_INTERVAL")
-	setBool(&cfg.Monitoring.DisconnectExtraSessions, "DISCONNECT_EXTRA_SESSIONS")
-	setBool(&cfg.Monitoring.AdminNotificationEnabled, "ADMIN_NOTIFICATION_ENABLED")
-}
-
-func setString(target *string, key string) {
-	if value, ok := os.LookupEnv(key); ok {
-		*target = strings.TrimSpace(value)
-	}
-}
-
-func setInt(target *int, key string) {
-	if value, ok := os.LookupEnv(key); ok {
-		parsed, err := strconv.Atoi(strings.TrimSpace(value))
-		if err == nil {
-			*target = parsed
+	for _, n := range c.Nodes {
+		if n.ID == id && n.Enabled {
+			return n, true
 		}
 	}
+	return Node{}, false
 }
-
-func setInt32(target *int32, key string) {
-	if value, ok := os.LookupEnv(key); ok {
-		parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 32)
-		if err == nil {
-			*target = int32(parsed)
+func (c *Config) Entries() []Node {
+	var r []Node
+	for _, n := range c.Nodes {
+		if n.Enabled && n.Entry {
+			r = append(r, n)
 		}
 	}
-}
-
-func setBool(target *bool, key string) {
-	if value, ok := os.LookupEnv(key); ok {
-		parsed, err := strconv.ParseBool(strings.TrimSpace(value))
-		if err == nil {
-			*target = parsed
-		}
-	}
-}
-
-func setDuration(target *time.Duration, key string) {
-	if value, ok := os.LookupEnv(key); ok {
-		parsed, err := time.ParseDuration(strings.TrimSpace(value))
-		if err == nil {
-			*target = parsed
-		}
-	}
-}
-
-func setIntSlice(target *[]int64, key string) {
-	value, ok := os.LookupEnv(key)
-	if !ok {
-		return
-	}
-
-	parts := strings.Split(value, ",")
-	result := make([]int64, 0, len(parts))
-	for _, part := range parts {
-		parsed, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
-		if err == nil {
-			result = append(result, parsed)
-		}
-	}
-	if len(result) > 0 {
-		*target = result
-	}
+	return r
 }

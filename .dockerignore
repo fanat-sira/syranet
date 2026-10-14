@@ -1,4 +1,3 @@
-# Only application sources and distributable config enter the build context.
 **
 !go.mod
 !go.sum
@@ -6,8 +5,11 @@
 !cmd/**
 !internal/
 !internal/**
-!configs/
-!configs/config.yaml
-!configs/singbox_template.json
 !migrations/
+!migrations/*.go
 !migrations/*.sql
+!tests/
+!tests/e2e/
+!tests/e2e/*.go
+!licenses/
+!licenses/SINGBOX-LICENSE

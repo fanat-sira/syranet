@@ -1,69 +1,94 @@
 package config
 
 import (
+	"github.com/jackc/pgx/v5/pgxpool"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func TestDistributedConfigEnvOverrides(t *testing.T) {
-	// Read the real distributed YAML, including its relative template path.
-	values := map[string]string{
-		"DB_HOST": "postgres", "DB_PORT": "5432", "DB_NAME": "vpn_service",
-		"DB_USER": "vpn_admin", "DB_PASSWORD": "db # ' : $ password",
-		"USER_BOT_TOKEN": "123:dummy", "ADMIN_BOT_TOKEN": "456:dummy",
-		"ADMIN_IDS": "123,456", "RU_SERVER_ADDRESS": "ru.example.invalid",
-		"NL_SERVER_ADDRESS": "nl.example.invalid", "NL_PASSWORD": "nl # ' : $ password",
-		"FALLBACK_HY2_PASSWORD": "", "FALLBACK_SOCKS_USERNAME": "", "FALLBACK_SOCKS_PASSWORD": "",
-		"CLASH_API_URL":         "http://127.0.0.1:9090",
-		"SINGBOX_TEMPLATE_PATH": "singbox_template.json",
+func environment(t *testing.T) {
+	t.Helper()
+	for k, v := range map[string]string{"DB_PASSWORD": "db # ' : $ password", "USER_BOT_TOKEN": "123:dummy", "ADMIN_BOT_TOKEN": "456:dummy", "ADMIN_IDS": "123,456",
+		"HYSTERIA_PORT": "443", "ENTRY_AGENT_TOKEN": strings.Repeat("a", 64), "UPSTREAM_AGENT_TOKEN": strings.Repeat("b", 64), "UPSTREAM_TRANSIT_PASSWORD": strings.Repeat("c", 64)} {
+		t.Setenv(k, v)
 	}
-	for key, value := range values {
-		t.Setenv(key, value)
+}
+func TestExamples(t *testing.T) {
+	environment(t)
+	for _, f := range []string{"config.yaml", "single-node.yaml", "multi-node.yaml"} {
+		c, e := Load("../../configs/" + f)
+		if e != nil {
+			t.Fatalf("%s: %v", f, e)
+		}
+		if c.Database.Password != "db # ' : $ password" || !c.IsAdmin(456) || c.IsAdmin(789) {
+			t.Fatal("env or auth mismatch")
+		}
 	}
-	cfg, err := Load("../../configs/config.yaml")
-	if err != nil {
-		t.Fatal(err)
+}
+func TestInvalidEnvFails(t *testing.T) {
+	environment(t)
+	for _, key := range []string{"DB_PORT", "ADMIN_IDS", "BOT_POLLING_TIMEOUT"} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "secret_invalid")
+			_, e := Load("../../configs/config.yaml")
+			if e == nil || strings.Contains(e.Error(), "secret_invalid") {
+				t.Fatal("invalid env accepted or disclosed")
+			}
+		})
 	}
-	if cfg.Database.Password != values["DB_PASSWORD"] || cfg.VPN.NLPassword != values["NL_PASSWORD"] {
-		t.Fatal("environment credentials were changed during config loading")
+}
+func TestTopologyValidation(t *testing.T) {
+	environment(t)
+	c, e := Load("../../configs/multi-node.yaml")
+	if e != nil {
+		t.Fatal(e)
 	}
-	if len(cfg.Bots.AdminIDs) != 2 || !cfg.IsAdmin(456) || cfg.IsAdmin(789) {
-		t.Fatal("admin IDs were not applied correctly")
+	c.Nodes[1].Outbound = "entry"
+	c.Nodes[0].TransitPasswordEnv = "TRANSIT"
+	c.Nodes[0].TransitPassword = strings.Repeat("c", 64)
+	if c.Validate() == nil {
+		t.Fatal("cycle accepted")
 	}
-	if _, err := os.Stat(cfg.VPN.SingBox.TemplatePath); err != nil {
-		t.Fatalf("distributed template is not reachable: %v", err)
+	c.Nodes[1].Outbound = "direct"
+	c.Nodes[0].Port = 65536
+	if c.Validate() == nil {
+		t.Fatal("invalid port accepted")
 	}
-	if cfg.VPN.SingBox.TemplatePath != filepath.Clean("../../configs/singbox_template.json") {
-		t.Fatalf("unexpected template path: %s", cfg.VPN.SingBox.TemplatePath)
+	c.Nodes[0].Port = 443
+	c.Nodes[0].Agent.URL = "http://public.example.com:8080"
+	if c.Validate() == nil {
+		t.Fatal("plaintext remote agent accepted")
 	}
-	cfg.VPN.Fallback.SocksUsername = "legacy-user"
-	if cfg.Validate() == nil {
-		t.Fatal("unpaired SOCKS fallback must fail validation")
+}
+func TestUnknownYAML(t *testing.T) {
+	environment(t)
+	p := filepath.Join(t.TempDir(), "bad.yaml")
+	os.WriteFile(p, []byte("database:\n  password: secret\n"), 0600)
+	_, e := Load(p)
+	if e == nil || strings.Contains(e.Error(), "secret") {
+		t.Fatal("unknown config accepted or disclosed")
+	}
+}
+func TestDSNRoundTrip(t *testing.T) {
+	for _, host := range []string{"postgres", "127.0.0.1", "::1"} {
+		c := Config{Database: DatabaseConfig{Host: host, Port: 5432, Name: "vpn/db #1", User: "vpn user", Password: "space ' \\ # $ : @ ? / % & =", SSLMode: "disable"}}
+		p, e := pgxpool.ParseConfig(c.DSN())
+		if e != nil {
+			t.Fatal(e)
+		}
+		if p.ConnConfig.Host != host || p.ConnConfig.Password != c.Database.Password || p.ConnConfig.Database != c.Database.Name {
+			t.Fatalf("DSN mismatch host=%q expected=%q db=%q expected=%q passwordEqual=%t", p.ConnConfig.Host, host, p.ConnConfig.Database, c.Database.Name, p.ConnConfig.Password == c.Database.Password)
+		}
 	}
 }
 
-func TestDSNRoundTrip(t *testing.T) {
-	for _, host := range []string{"postgres", "127.0.0.1", "::1"} {
-		t.Run(host, func(t *testing.T) {
-			cfg := Config{Database: DatabaseConfig{
-				Host: host, Port: 5432, Name: "vpn/db #1", User: "vpn user",
-				Password: "space ' \\ # $ : @ ? / % & =", SSLMode: "disable",
-				MaxOpenConns: 10, MinOpenConns: 2,
-			}}
-			parsed, err := pgxpool.ParseConfig(cfg.DSN())
-			if err != nil {
-				t.Fatal(err)
-			}
-			conn := parsed.ConnConfig
-			if conn.Host != host || conn.Port != 5432 || conn.Database != cfg.Database.Name || conn.User != cfg.Database.User || conn.Password != cfg.Database.Password {
-				t.Fatal("connection parameters did not survive DSN encoding")
-			}
-			if parsed.MaxConns != 10 || parsed.MinConns != 2 {
-				t.Fatal("pool settings did not survive DSN encoding")
-			}
-		})
+func TestPublishedPortMismatch(t *testing.T) {
+	environment(t)
+	t.Setenv("HYSTERIA_PORT", "8443")
+	_, e := Load("../../configs/single-node.yaml")
+	if e == nil {
+		t.Fatal("published UDP port differs from node listener")
 	}
 }

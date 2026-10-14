@@ -10,8 +10,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
-	"vpn-service/internal/config"
-	"vpn-service/internal/models"
+	"github.com/fanat-sira/syranet/internal/config"
+	"github.com/fanat-sira/syranet/internal/models"
 )
 
 type Store struct {
@@ -79,7 +79,7 @@ DO UPDATE SET
 RETURNING id, telegram_id, telegram_username, first_name, last_name, hy2_username, hy2_password,
 	      socks_username, socks_password, status, created_at, updated_at, approved_at, approved_by,
 	      expires_at, referral_source, intended_use, accepted_terms, last_connected_at, last_connected_ip,
-	      current_connections`
+	      current_connections, node_id`
 
 	row := s.pool.QueryRow(ctx, query,
 		profile.TelegramID,
@@ -107,7 +107,7 @@ SET referral_source = $2,
 	accepted_terms = $4,
 	status = $5,
 	updated_at = NOW()
-WHERE telegram_id = $1`, telegramID, referralSource, intendedUse, acceptedTerms, models.UserStatusPending)
+WHERE telegram_id = $1 AND status = 'pending' AND accepted_terms = false`, telegramID, referralSource, intendedUse, acceptedTerms, models.UserStatusPending)
 	if err != nil {
 		return fmt.Errorf("update questionnaire: %w", err)
 	}
@@ -128,7 +128,7 @@ func (s *Store) GetUserByID(ctx context.Context, id int64) (*models.User, error)
 }
 
 func (s *Store) ListPendingUsers(ctx context.Context) ([]models.User, error) {
-	rows, err := s.pool.Query(ctx, selectUserQuery+` WHERE status = $1 ORDER BY created_at ASC`, models.UserStatusPending)
+	rows, err := s.pool.Query(ctx, selectUserQuery+` WHERE status = $1 ORDER BY created_at ASC LIMIT 20`, models.UserStatusPending)
 	if err != nil {
 		return nil, fmt.Errorf("list pending users: %w", err)
 	}
@@ -164,96 +164,6 @@ func (s *Store) ListUsersByStatuses(ctx context.Context, statuses []models.UserS
 	return users, total, nil
 }
 
-func (s *Store) ApproveUser(ctx context.Context, adminTelegramID, userID int64, subscriptionDays int) error {
-	result, err := s.pool.Exec(ctx, `
-UPDATE users
-SET status = $2,
-	approved_at = NOW(),
-	approved_by = $3,
-	expires_at = COALESCE(GREATEST(expires_at, NOW()), NOW()) + ($4 || ' days')::interval,
-	updated_at = NOW()
-WHERE id = $1
-  AND status IN ($5, $6, $7)`, userID, models.UserStatusActive, adminTelegramID, subscriptionDays, models.UserStatusPending, models.UserStatusRejected, models.UserStatusExpired)
-	if err != nil {
-		return fmt.Errorf("approve user: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return pgx.ErrNoRows
-	}
-	return s.RecordAdminAction(ctx, adminTelegramID, &userID, "approve", fmt.Sprintf("subscription_days=%d", subscriptionDays))
-}
-
-func (s *Store) RejectUser(ctx context.Context, adminTelegramID, userID int64, reason string) error {
-	result, err := s.pool.Exec(ctx, `
-UPDATE users
-SET status = $2,
-	updated_at = NOW()
-WHERE id = $1`, userID, models.UserStatusRejected)
-	if err != nil {
-		return fmt.Errorf("reject user: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return pgx.ErrNoRows
-	}
-	return s.RecordAdminAction(ctx, adminTelegramID, &userID, "reject", reason)
-}
-
-func (s *Store) ExtendUser(ctx context.Context, adminTelegramID, userID int64, days int, reason string) error {
-	result, err := s.pool.Exec(ctx, `
-UPDATE users
-SET expires_at = COALESCE(GREATEST(expires_at, NOW()), NOW()) + ($2 || ' days')::interval,
-	status = CASE WHEN status = $4 THEN $5 ELSE status END,
-	updated_at = NOW()
-WHERE id = $1`, userID, days, models.UserStatusActive, models.UserStatusExpired, models.UserStatusActive)
-	if err != nil {
-		return fmt.Errorf("extend user: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return pgx.ErrNoRows
-	}
-	if reason == "" {
-		reason = fmt.Sprintf("days=%d", days)
-	}
-	return s.RecordAdminAction(ctx, adminTelegramID, &userID, "extend", reason)
-}
-
-func (s *Store) SuspendUser(ctx context.Context, adminTelegramID, userID int64) error {
-	result, err := s.pool.Exec(ctx, `UPDATE users SET status = $2, updated_at = NOW() WHERE id = $1`, userID, models.UserStatusSuspended)
-	if err != nil {
-		return fmt.Errorf("suspend user: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return pgx.ErrNoRows
-	}
-	return s.RecordAdminAction(ctx, adminTelegramID, &userID, "suspend", "")
-}
-
-func (s *Store) ActivateUser(ctx context.Context, adminTelegramID, userID int64) error {
-	result, err := s.pool.Exec(ctx, `
-UPDATE users
-SET status = $2,
-	updated_at = NOW(),
-	expires_at = COALESCE(expires_at, NOW())
-WHERE id = $1`, userID, models.UserStatusActive)
-	if err != nil {
-		return fmt.Errorf("activate user: %w", err)
-	}
-	if result.RowsAffected() == 0 {
-		return pgx.ErrNoRows
-	}
-	return s.RecordAdminAction(ctx, adminTelegramID, &userID, "activate", "")
-}
-
-func (s *Store) RecordAdminAction(ctx context.Context, adminID int64, targetUserID *int64, action, reason string) error {
-	_, err := s.pool.Exec(ctx, `
-INSERT INTO admin_logs (admin_id, target_user_id, action, reason)
-VALUES ($1, $2, $3, $4)`, adminID, targetUserID, action, reason)
-	if err != nil {
-		return fmt.Errorf("record admin action: %w", err)
-	}
-	return nil
-}
-
 func (s *Store) GetStats(ctx context.Context) (*models.UserStats, error) {
 	stats := &models.UserStats{}
 	query := `
@@ -262,7 +172,7 @@ SELECT
 	COUNT(*) FILTER (WHERE status = 'active') AS active,
 	COUNT(*) FILTER (WHERE status = 'pending') AS pending,
 	COUNT(*) FILTER (WHERE status = 'expired') AS expired,
-	COUNT(*) FILTER (WHERE status = 'approved') AS approved,
+	COUNT(*) FILTER (WHERE status = 'revoked') AS revoked,
 	COUNT(*) FILTER (WHERE status = 'rejected') AS rejected,
 	COUNT(*) FILTER (WHERE status = 'suspended') AS suspended
 FROM users`
@@ -272,7 +182,7 @@ FROM users`
 		&stats.Active,
 		&stats.Pending,
 		&stats.Expired,
-		&stats.Approved,
+		&stats.Revoked,
 		&stats.Rejected,
 		&stats.Suspended,
 	); err != nil {
@@ -287,9 +197,9 @@ func (s *Store) ExpireUsers(ctx context.Context) (int64, error) {
 UPDATE users
 SET status = $1,
 	updated_at = NOW()
-WHERE status IN ($2, $3)
+WHERE status = $2
   AND expires_at IS NOT NULL
-  AND expires_at < NOW()`, models.UserStatusExpired, models.UserStatusActive, models.UserStatusApproved)
+  AND expires_at < NOW()`, models.UserStatusExpired, models.UserStatusActive)
 	if err != nil {
 		return 0, fmt.Errorf("expire users: %w", err)
 	}
@@ -298,10 +208,10 @@ WHERE status IN ($2, $3)
 
 func (s *Store) ListConfigUsers(ctx context.Context) ([]models.User, error) {
 	rows, err := s.pool.Query(ctx, selectUserQuery+`
- WHERE status IN ($1, $2)
+ WHERE status = $1
    AND expires_at IS NOT NULL
    AND expires_at > NOW()
- ORDER BY id ASC`, models.UserStatusActive, models.UserStatusApproved)
+ ORDER BY id ASC`, models.UserStatusActive)
 	if err != nil {
 		return nil, fmt.Errorf("list config users: %w", err)
 	}
@@ -309,31 +219,12 @@ func (s *Store) ListConfigUsers(ctx context.Context) ([]models.User, error) {
 	return collectUsers(rows)
 }
 
-func (s *Store) UpdateConnectionState(ctx context.Context, userID int64, connectionCount int, lastIP string, connectedAt *time.Time) error {
-	_, err := s.pool.Exec(ctx, `
-UPDATE users
-SET current_connections = $2,
-	last_connected_ip = $3,
-	last_connected_at = $4,
-	updated_at = NOW()
-WHERE id = $1`, userID, connectionCount, lastIP, connectedAt)
-	if err != nil {
-		return fmt.Errorf("update connection state: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) FindUserByAccessUsername(ctx context.Context, username string) (*models.User, error) {
-	row := s.pool.QueryRow(ctx, selectUserQuery+` WHERE hy2_username = $1 OR socks_username = $1`, username)
-	return scanUser(row)
-}
-
 func (s *Store) ListUsersExpiringBefore(ctx context.Context, before time.Time) ([]models.User, error) {
 	rows, err := s.pool.Query(ctx, selectUserQuery+`
- WHERE status IN ($1, $2)
+ WHERE status = $1
    AND expires_at IS NOT NULL
-   AND expires_at <= $3
- ORDER BY expires_at ASC`, models.UserStatusActive, models.UserStatusApproved, before)
+   AND expires_at <= $2
+ ORDER BY expires_at ASC`, models.UserStatusActive, before)
 	if err != nil {
 		return nil, fmt.Errorf("list expiring users: %w", err)
 	}
@@ -384,6 +275,7 @@ func scanUser(scanner interface{ Scan(dest ...any) error }) (*models.User, error
 		&user.LastConnectedAt,
 		&user.LastConnectedIP,
 		&user.CurrentConnections,
+		&user.NodeID,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, err
@@ -397,5 +289,5 @@ const selectUserQuery = `
 SELECT id, telegram_id, telegram_username, first_name, last_name, hy2_username, hy2_password,
        socks_username, socks_password, status, created_at, updated_at, approved_at, approved_by,
        expires_at, referral_source, intended_use, accepted_terms, last_connected_at, last_connected_ip,
-       current_connections
+       current_connections, node_id
 FROM users`

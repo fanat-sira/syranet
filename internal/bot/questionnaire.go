@@ -5,7 +5,7 @@ import (
 	"strings"
 	"sync"
 
-	"vpn-service/internal/models"
+	"github.com/fanat-sira/syranet/internal/models"
 )
 
 type QuestionStep int
@@ -40,6 +40,9 @@ func NewQuestionnaireManager() *QuestionnaireManager {
 }
 
 func (m *QuestionnaireManager) Start(user *models.User) string {
+	if user == nil {
+		return stepPrompt(StepReferral)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
