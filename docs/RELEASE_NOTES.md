@@ -14,9 +14,9 @@ First release candidate of **Syranet: Self-hosted VPN/Proxy Access Management**.
 
 ## Validation
 
-The Docker E2E pipeline and GitHub secret scan passed on commit `06e33ffb6feadfbd26ebecab19b75bb1c81802a3`. The original Go job passed formatting, vet, tests/race and build, but failed its vulnerability scan on Go 1.27.1. This release candidate must target the subsequent Go 1.27.2 correction **after a complete green CI run**; do not attach it to the old failing commit.
+[GitHub Actions CI](https://github.com/fanat-sira/syranet/actions/runs/38567519723) passed on commit `0b9ef3a8f0d43737a8f57852ead18da14c149f39` with Go 1.27.2. Go formatting, vet, tests/race, build, vulnerability scan, script syntax, Docker E2E and the secret scan all passed.
 
-See docs/VERIFICATION.md for local Go 1.27.2 results and the exact GitHub evidence.
+See [VERIFICATION.md](VERIFICATION.md) for test coverage and deployment validation scope.
 
 ## Deployment status and compatibility
 

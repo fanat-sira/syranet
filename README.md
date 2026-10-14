@@ -226,7 +226,7 @@ GitHub Actions defines formatting, vet, tests/race, build, vulnerability/secret 
 
 ## Project status
 
-Engineering/deployment validation release, **not claimed production-ready**. Read the verification record before public use. No fabricated user counts, throughput or uptime guarantees are included. [Architecture and portfolio description](docs/PORTFOLIO.md) contains suggested repository metadata, not remotely applied changes.
+Release candidate with passing Go, Docker E2E and secret checks in GitHub Actions. See the [verification record](docs/VERIFICATION.md) for tested behavior and deployment validation scope.
 
 ## License
 
