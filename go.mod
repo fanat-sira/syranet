@@ -1,6 +1,6 @@
 module github.com/fanat-sira/syranet
 
-go 1.26.0
+go 1.27.2
 
 require (
 	github.com/go-telegram-bot-api/telegram-bot-api/v5 v5.5.1

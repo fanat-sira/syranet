@@ -53,7 +53,7 @@ Each configured node runs the provided supervisor and its own sing-box process. 
 - Two Telegram BotFather tokens and your positive numeric Telegram user ID.
 - Default public port: **443/UDP**. **80/TCP** must be reachable for Certbot standalone issuance and renewal. Remote management uses restricted **8443/TCP**. PostgreSQL and the local node API are not published.
 
-The node executable is pinned to **sing-box 1.14.3**. PostgreSQL is pinned to **16.15**. Build/CI use Go **1.27.1**; the module requires Go 1.26+.
+The node executable is pinned to **sing-box 1.14.3**. PostgreSQL is pinned to **16.15**. Build/CI use Go **1.27.2**; the module requires Go 1.27.2+.
 
 ## Quick Start: one VPS
 
@@ -222,7 +222,7 @@ GitHub Actions defines formatting, vet, tests/race, build, vulnerability/secret 
 - No mesh orchestration, device limits, payments, built-in TUN client or web dashboard.
 - One management instance is recommended: DB locks serialize config work, but Telegram long polling and in-memory questionnaire/reminder sessions are not an HA interface.
 - Anonymous public access is never intentionally created. Private SOCKS is reachable only through the container/private network you explicitly arrange, not automatically on the host loopback.
-- Docker/VPS deployment, public ACME issuance and live Telegram delivery need the verification recorded in VERIFICATION.md; prepared instructions are not production proof.
+- Docker E2E has passed on GitHub Actions. Real VPS deployment, public ACME issuance and live Telegram delivery remain unverified; see VERIFICATION.md for separate CI and production evidence.
 
 ## Project status
 

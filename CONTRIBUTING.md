@@ -1,6 +1,6 @@
 # Contributing
 
-Use Go 1.26+ (the CI/build image is pinned to 1.27.1). Keep the project small and preserve configuration validation, private-chat authorization, verified TLS and desired/applied state semantics.
+Use Go 1.27.2+ (the CI/build image is pinned to 1.27.2). Keep the project small and preserve configuration validation, private-chat authorization, verified TLS and desired/applied state semantics.
 
 ```sh
 gofmt -w cmd internal migrations tests
